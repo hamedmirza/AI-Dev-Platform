@@ -1,0 +1,18 @@
+Read /docs/MASTER_BUILD_SPEC.md and follow it exactly.
+
+Start by inspecting the repository and determining whether this should be implemented as a greenfield build or integrated into the current structure.
+
+Before writing code:
+1. summarize the current repo structure
+2. map spec requirements to current files/folders
+3. list the exact files you will create or modify in phase 1 only
+4. wait for no confirmation; proceed with phase 1 implementation directly
+5. after phase 1, run validations and report exact results
+
+Rules:
+- do not guess
+- do not modify unrelated files
+- do not create duplicate architectures
+- do not claim completion without validation
+- use incremental edits only
+- keep changes production-structured

@@ -1,0 +1,16 @@
+# Cursor Project Rules
+
+- Always inspect before editing.
+- Always report planned file changes before implementing.
+- Never change unrelated files.
+- Never replace working logic without reason.
+- Use Python 3.12.
+- Use FastAPI, LangGraph, Pydantic v2, pytest, ruff, mypy.
+- Store prompts in files, not giant inline strings.
+- Use provider adapters for LM Studio.
+- Keep file access bounded to workspace root.
+- Never execute arbitrary shell commands from model output.
+- All agent outputs must be structured and validated.
+- Run lint, type checks, and tests after each milestone.
+- Report exact validation results, not summaries.
+- If blocked, stop and explain with concrete reasons.
