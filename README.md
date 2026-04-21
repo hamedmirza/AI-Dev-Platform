@@ -1,29 +1,40 @@
-# AI Dev Platform — Cursor Ready Bundle
+# AI Dev Platform
 
-This repo is a starter scaffold for building a local-first multi-agent software development platform using:
+This repo is now a working local-first software delivery platform with:
 
 - FastAPI
-- LangGraph
+- server-rendered operator UI
+- background run orchestration
 - Pydantic v2
 - SQLite
 - LM Studio via OpenAI-compatible API
 - pytest / ruff / mypy
 
-## Included
-- Full build spec: `docs/MASTER_BUILD_SPEC.md`
-- Cursor rules: `.cursor/rules/ai-dev-team.mdc`
-- Cursor kickoff prompt: `prompts/cursor_kickoff_prompt.txt`
-- Repo scaffold matching the target architecture
-- Starter `pyproject.toml`
+## Local Run
+1. Create `.env` from `.env.example` if needed.
+2. Start the app:
+   - `bash scripts/dev_start.sh`
+3. Open:
+   - `http://127.0.0.1:8400/ui/login`
+4. Log in with the operator token from `.env`.
+
+## Current Features
+- operator dashboard, repository view, provider view, settings view, backups view
+- task submission and background run processing
+- run timeline, artifacts, code-review summary, and workspace diff view
+- local backup creation and restore rehearsal
+- local repository workspace cloning and cleanup
+
+## Validation
+- `ruff check app tests`
+- `mypy app`
+- `pytest -q`
+
+## Deployment
+- `Dockerfile`
+- `docker-compose.yml`
 - `.env.example`
-- Minimal placeholder prompt files
 
-## Use in Cursor
-1. Open this folder in Cursor.
-2. Make sure `.cursor/rules/ai-dev-team.mdc` is enabled.
-3. Open `docs/MASTER_BUILD_SPEC.md`.
-4. Paste `prompts/cursor_kickoff_prompt.txt` into Cursor chat.
-5. Let Cursor implement phase 1 incrementally.
-
-## Notes
-This bundle is intentionally scaffold-first. It is meant to reduce ambiguity and give Cursor a controlled starting point rather than pretending the full platform is already implemented.
+## Docs
+- [docs/MASTER_BUILD_SPEC.md](docs/MASTER_BUILD_SPEC.md)
+- [docs/RUNBOOK.md](docs/RUNBOOK.md)

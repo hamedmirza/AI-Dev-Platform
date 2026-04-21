@@ -9,7 +9,7 @@ from typing import Optional, cast
 
 from pydantic import BaseModel
 
-from app.core.enums import ArtifactType, RunStage, RunStatus
+from app.core.enums import ArtifactType, ProviderStatus, RunStage, RunStatus
 from app.core.exceptions import ProviderError
 from app.core.settings import get_settings
 from app.db.models import ArtifactModel, RunEventModel, RunModel, TaskModel
@@ -20,8 +20,13 @@ from app.schemas.code_change import CodeChangeResponse
 from app.schemas.plan import PlanResponse
 from app.schemas.review import ReviewResponse
 from app.schemas.test_result import TestResultResponse
+from app.services.repository_service import create_run_workspace
 
 logger = logging.getLogger(__name__)
+
+MAX_REVIEW_RETRIES = 3
+MAX_TEST_RETRIES = 3
+MAX_TOTAL_RETRIES = 5
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,9 @@ class OrchestrationService:
         settings = get_settings()
         settings.workspace_root_path.mkdir(parents=True, exist_ok=True)
         settings.backup_root_path.mkdir(parents=True, exist_ok=True)
+        provider_health = get_provider().healthcheck()
+        if provider_health.status == ProviderStatus.UNAVAILABLE:
+            raise ProviderError(provider_health.detail)
 
         if self._worker_thread and self._worker_thread.is_alive():
             return
@@ -152,87 +160,111 @@ class OrchestrationService:
                 return
 
             provider = get_provider()
+            workspace_path = create_run_workspace(run.id)
             run.status = RunStatus.RUNNING
-            session.add(
-                RunEventModel(
-                    run_id=run.id,
-                    event_type="run_started",
-                    message="Worker started the run.",
-                )
+            self._add_event(
+                session,
+                run.id,
+                "run_started",
+                f"Worker started the run in {workspace_path}.",
             )
             session.commit()
 
-            for stage in STAGES:
-                run.current_stage = stage.stage
-                session.add(
-                    RunEventModel(
-                        run_id=run.id,
-                        event_type=f"{stage.stage}_started",
-                        message=f"Started {stage.stage} stage.",
-                    )
-                )
-                session.commit()
+            planner_stage = self._stage_by_name(RunStage.PLANNER)
+            architect_stage = self._stage_by_name(RunStage.ARCHITECT)
+            coder_stage = self._stage_by_name(RunStage.CODER)
+            reviewer_stage = self._stage_by_name(RunStage.REVIEWER)
+            tester_stage = self._stage_by_name(RunStage.TESTER)
 
-                model = self._invoke_stage(provider, stage, task.request_text)
-                artifact = self._make_artifact(
-                    run.id,
-                    stage.artifact_type,
-                    stage.artifact_title,
-                    model,
-                )
-                session.add(artifact)
+            planner_model = self._run_stage(session, run, provider, planner_stage, task.request_text)
+            architect_model = self._run_stage(session, run, provider, architect_stage, task.request_text)
 
-                if stage.stage == RunStage.REVIEWER:
-                    review_model = cast(ReviewResponse, model)
-                    if not review_model.approved:
-                        run.status = RunStatus.NEEDS_REVISION
-                        run.error_message = "Reviewer requested changes."
-                        session.add(
-                            RunEventModel(
-                                run_id=run.id,
-                                event_type="review_rejected",
-                                message="Reviewer rejected the current proposal.",
-                                payload_json=review_model.model_dump_json(),
-                            )
+            review_retries = 0
+            test_retries = 0
+            total_retries = 0
+            retry_feedback: list[str] = []
+
+            while True:
+                coder_prompt = self._build_coder_request(
+                    task.request_text,
+                    planner_model,
+                    architect_model,
+                    retry_feedback,
+                )
+                self._run_stage(session, run, provider, coder_stage, coder_prompt)
+
+                review_prompt = self._build_review_request(task.request_text, retry_feedback)
+                review_model = cast(
+                    ReviewResponse,
+                    self._run_stage(session, run, provider, reviewer_stage, review_prompt),
+                )
+                if not review_model.approved:
+                    review_retries += 1
+                    total_retries += 1
+                    retry_feedback = [review_model.summary, *review_model.issues]
+                    if self._should_block(run, review_retries, test_retries, total_retries):
+                        self._block_run(
+                            session,
+                            run,
+                            "Reviewer rejection threshold exceeded.",
+                            review_model.model_dump_json(),
                         )
-                        session.commit()
                         return
 
-                if stage.stage == RunStage.TESTER:
-                    test_model = cast(TestResultResponse, model)
-                    if not test_model.passed:
-                        run.status = RunStatus.NEEDS_REVISION
-                        run.error_message = "Validation stage reported failures."
-                        session.add(
-                            RunEventModel(
-                                run_id=run.id,
-                                event_type="tests_failed",
-                                message="Validation stage reported failures.",
-                                payload_json=test_model.model_dump_json(),
-                            )
+                    run.status = RunStatus.REVIEW_REQUIRED
+                    run.error_message = "Reviewer requested changes."
+                    self._add_event(
+                        session,
+                        run.id,
+                        "review_rejected",
+                        "Reviewer rejected the current proposal; retrying coder stage.",
+                        review_model.model_dump_json(),
+                    )
+                    session.commit()
+                    run.status = RunStatus.RUNNING
+                    continue
+
+                test_prompt = self._build_test_request(task.request_text, retry_feedback)
+                test_model = cast(
+                    TestResultResponse,
+                    self._run_stage(session, run, provider, tester_stage, test_prompt),
+                )
+                if not test_model.passed:
+                    test_retries += 1
+                    total_retries += 1
+                    retry_feedback = [test_model.summary, *test_model.failures]
+                    if self._should_block(run, review_retries, test_retries, total_retries):
+                        self._block_run(
+                            session,
+                            run,
+                            "Validation retry threshold exceeded.",
+                            test_model.model_dump_json(),
                         )
-                        session.commit()
                         return
 
-                session.add(
-                    RunEventModel(
-                        run_id=run.id,
-                        event_type=f"{stage.stage}_completed",
-                        message=f"Completed {stage.stage} stage.",
-                        payload_json=model.model_dump_json(),
+                    run.status = RunStatus.REVIEW_REQUIRED
+                    run.error_message = "Validation stage reported failures."
+                    self._add_event(
+                        session,
+                        run.id,
+                        "tests_failed",
+                        "Validation stage reported failures; retrying coder stage.",
+                        test_model.model_dump_json(),
                     )
-                )
-                session.commit()
+                    session.commit()
+                    run.status = RunStatus.RUNNING
+                    continue
+
+                break
 
             run.status = RunStatus.AWAITING_APPROVAL
             run.current_stage = RunStage.APPROVAL
             run.error_message = None
-            session.add(
-                RunEventModel(
-                    run_id=run.id,
-                    event_type="awaiting_approval",
-                    message="Run is awaiting operator approval before any git-side effects.",
-                )
+            self._add_event(
+                session,
+                run.id,
+                "awaiting_approval",
+                "Run is awaiting operator approval before any git-side effects.",
             )
             session.commit()
         except ProviderError as exc:
@@ -241,16 +273,114 @@ class OrchestrationService:
                 run.status = RunStatus.FAILED
                 run.current_stage = run.current_stage or RunStage.INTAKE
                 run.error_message = str(exc)
-                session.add(
-                    RunEventModel(
-                        run_id=run.id,
-                        event_type="provider_failed",
-                        message=str(exc),
-                    )
-                )
+                self._add_event(session, run.id, "provider_failed", str(exc))
                 session.commit()
         finally:
             session.close()
+
+    def _stage_by_name(self, stage_name: RunStage) -> StageDefinition:
+        for stage in STAGES:
+            if stage.stage == stage_name:
+                return stage
+        raise ProviderError(f"Stage definition missing for {stage_name}.")
+
+    def _run_stage(
+        self,
+        session,
+        run: RunModel,
+        provider,
+        stage: StageDefinition,
+        request_text: str,
+    ) -> BaseModel:
+        run.current_stage = stage.stage
+        self._add_event(session, run.id, f"{stage.stage}_started", f"Started {stage.stage} stage.")
+        session.commit()
+
+        model = self._invoke_stage(provider, stage, request_text)
+        session.add(
+            self._make_artifact(
+                run.id,
+                stage.artifact_type,
+                stage.artifact_title,
+                model,
+            )
+        )
+        self._add_event(
+            session,
+            run.id,
+            f"{stage.stage}_completed",
+            f"Completed {stage.stage} stage.",
+            model.model_dump_json(),
+        )
+        session.commit()
+        return model
+
+    def _should_block(
+        self,
+        run: RunModel,
+        review_retries: int,
+        test_retries: int,
+        total_retries: int,
+    ) -> bool:
+        return (
+            review_retries >= MAX_REVIEW_RETRIES
+            or test_retries >= MAX_TEST_RETRIES
+            or total_retries >= MAX_TOTAL_RETRIES
+        )
+
+    def _block_run(self, session, run: RunModel, message: str, payload_json: str) -> None:
+        run.status = RunStatus.BLOCKED
+        run.current_stage = RunStage.CODER
+        run.error_message = message
+        self._add_event(session, run.id, "run_blocked", message, payload_json)
+        session.commit()
+
+    def _add_event(
+        self,
+        session,
+        run_id: str,
+        event_type: str,
+        message: str,
+        payload_json: Optional[str] = None,
+    ) -> None:
+        session.add(
+            RunEventModel(
+                run_id=run_id,
+                event_type=event_type,
+                message=message,
+                payload_json=payload_json,
+            )
+        )
+
+    def _build_coder_request(
+        self,
+        request_text: str,
+        planner_model: PlanResponse,
+        architect_model: ArchitectureResponse,
+        retry_feedback: list[str],
+    ) -> str:
+        sections = [
+            request_text,
+            "\nPlanner summary:",
+            planner_model.model_dump_json(indent=2),
+            "\nArchitecture plan:",
+            architect_model.model_dump_json(indent=2),
+        ]
+        if retry_feedback:
+            sections.extend(["\nRetry feedback:", *[f"- {item}" for item in retry_feedback]])
+        return "\n".join(sections)
+
+    def _build_review_request(self, request_text: str, retry_feedback: list[str]) -> str:
+        if not retry_feedback:
+            return request_text
+        return "\n".join([request_text, "Focus review on prior issues being resolved:", *retry_feedback])
+
+    def _build_test_request(self, request_text: str, retry_feedback: list[str]) -> str:
+        if not retry_feedback:
+            return request_text
+        return "\n".join(
+            [request_text, "Focus validation on prior failures being resolved:", *retry_feedback]
+        )
 
     def _invoke_stage(self, provider, stage: StageDefinition, request_text: str) -> BaseModel:
         prompt_path = Path(stage.system_prompt_path)

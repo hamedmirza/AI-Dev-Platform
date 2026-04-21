@@ -7,10 +7,12 @@ class StringEnum(str, Enum):
 
 
 class RunStatus(StringEnum):
-    QUEUED = "queued"
+    PENDING = "pending"
     RUNNING = "running"
-    NEEDS_REVISION = "needs_revision"
+    REVIEW_REQUIRED = "review_required"
+    BLOCKED = "blocked"
     AWAITING_APPROVAL = "awaiting_approval"
+    CANCELLED = "cancelled"
     FAILED = "failed"
     COMPLETED = "completed"
 

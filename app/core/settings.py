@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
     app_env: str = Field(default="development", alias="APP_ENV")
     app_host: str = Field(default="0.0.0.0", alias="APP_HOST")
-    app_port: int = Field(default=8000, alias="APP_PORT")
+    app_port: int = Field(default=8400, alias="APP_PORT")
     app_api_token: str = Field(default="dev-token", alias="APP_API_TOKEN")
 
     db_url: str = Field(default="sqlite:///./app.db", alias="DB_URL")
@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     source_repo_path: Optional[str] = Field(default=None, alias="SOURCE_REPO_PATH")
     backup_root: str = Field(default="./backups", alias="BACKUP_ROOT")
     encryption_key: str = Field(default="change-me", alias="APP_ENCRYPTION_KEY")
+    git_author_name: str = Field(default="AI Dev Platform", alias="GIT_AUTHOR_NAME")
+    git_author_email: str = Field(
+        default="ai-dev-platform@example.com",
+        alias="GIT_AUTHOR_EMAIL",
+    )
 
     worker_count: int = Field(default=1, alias="WORKER_COUNT")
     artifact_char_limit: int = Field(default=12000, alias="ARTIFACT_CHAR_LIMIT")
@@ -49,9 +54,13 @@ class Settings(BaseSettings):
 
     @property
     def source_repo_path_resolved(self) -> Optional[Path]:
-        if not self.source_repo_path:
-            return None
-        return Path(self.source_repo_path).resolve()
+        if self.source_repo_path:
+            return Path(self.source_repo_path).resolve()
+
+        cwd = Path.cwd().resolve()
+        if (cwd / ".git").exists():
+            return cwd
+        return None
 
 
 @lru_cache(maxsize=1)

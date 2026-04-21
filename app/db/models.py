@@ -1,5 +1,6 @@
 
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import uuid4
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
@@ -31,7 +32,7 @@ class RunModel(Base):
     status: Mapped[str] = mapped_column(String(64), index=True)
     current_stage: Mapped[str] = mapped_column(String(64))
     provider_name: Mapped[str] = mapped_column(String(64))
-    error_message: Mapped[str] = mapped_column(Text, nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -57,7 +58,7 @@ class RunEventModel(Base):
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
     event_type: Mapped[str] = mapped_column(String(128))
     message: Mapped[str] = mapped_column(Text)
-    payload_json: Mapped[str] = mapped_column(Text, nullable=True)
+    payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     run: Mapped[RunModel] = relationship(back_populates="events")

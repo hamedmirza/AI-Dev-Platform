@@ -588,7 +588,7 @@ Safe runtime config summary without secrets
 ```env
 APP_ENV=development
 APP_HOST=0.0.0.0
-APP_PORT=8000
+APP_PORT=8400
 
 DB_URL=sqlite:///./app.db
 

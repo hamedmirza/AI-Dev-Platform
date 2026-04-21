@@ -22,3 +22,13 @@ class RunEventResponse(BaseModel):
     message: str
     payload_json: Optional[str]
     created_at: datetime
+
+
+class RunActionRequest(BaseModel):
+    note: Optional[str] = None
+
+
+class RunActionResponse(BaseModel):
+    run_id: str
+    status: str
+    message: str

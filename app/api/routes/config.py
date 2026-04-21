@@ -4,6 +4,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from app.core.settings import get_settings
+from app.services.github_service import get_github_status
+from app.services.repository_service import get_repository_config_snapshot
 
 router = APIRouter(tags=["config"])
 
@@ -23,13 +25,11 @@ def config_summary() -> dict[str, object]:
     return {
         "app_env": settings.app_env,
         "model_provider": settings.model_provider,
-        "workspace_root": str(settings.workspace_root_path),
         "backup_root": str(settings.backup_root_path),
-        "source_repo_path": (
-            str(settings.source_repo_path_resolved) if settings.source_repo_path_resolved else None
-        ),
         "worker_count": settings.worker_count,
         "provider_snapshot_policy": "future_runs_only",
         "git_transport": "host-managed",
         "github_api_auth": "app-managed-token",
+        "repository": get_repository_config_snapshot(),
+        "github": get_github_status(),
     }

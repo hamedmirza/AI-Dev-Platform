@@ -7,13 +7,13 @@ from app.schemas.task import TaskCreate, TaskCreated
 
 
 def create_task_and_run(session: Session, payload: TaskCreate, provider_name: str) -> TaskCreated:
-    task = TaskModel(title=payload.title, request_text=payload.request_text)
+    task = TaskModel(title=payload.title, request_text=payload.to_prompt_text())
     session.add(task)
     session.flush()
 
     run = RunModel(
         task_id=task.id,
-        status=RunStatus.QUEUED,
+        status=RunStatus.PENDING,
         current_stage=RunStage.INTAKE,
         provider_name=provider_name,
     )
@@ -24,7 +24,7 @@ def create_task_and_run(session: Session, payload: TaskCreate, provider_name: st
         RunEventModel(
             run_id=run.id,
             event_type="run_created",
-            message="Run created and queued for processing.",
+            message="Run created and marked pending for processing.",
             payload_json=None,
         )
     )
