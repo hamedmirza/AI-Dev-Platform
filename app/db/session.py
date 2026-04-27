@@ -2,7 +2,7 @@
 from collections.abc import Generator
 from functools import lru_cache
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.settings import get_settings
@@ -40,6 +40,43 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    from app.db.models import ArtifactModel, RunEventModel, RunModel, TaskModel  # noqa: F401
+    from app.db.models import (  # noqa: F401
+        ArtifactModel,
+        RunEventModel,
+        RunModel,
+        RunStateSnapshotModel,
+        TaskModel,
+    )
 
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    _apply_lightweight_migrations(engine)
+
+
+def _apply_lightweight_migrations(engine) -> None:
+    inspector = inspect(engine)
+
+    task_columns = {column["name"] for column in inspector.get_columns("tasks")}
+    run_columns = {column["name"] for column in inspector.get_columns("runs")}
+
+    task_additions = {
+        "description": "TEXT",
+        "workspace_path": "TEXT",
+        "task_type": "VARCHAR(128)",
+        "constraints_json": "TEXT DEFAULT '[]' NOT NULL",
+        "target_files_json": "TEXT DEFAULT '[]' NOT NULL",
+        "provider_override": "VARCHAR(128)",
+        "model_override": "VARCHAR(255)",
+    }
+    run_additions = {
+        "request_id": "VARCHAR(64)",
+        "retry_count": "INTEGER DEFAULT 0 NOT NULL",
+    }
+
+    with engine.begin() as connection:
+        for column_name, ddl in task_additions.items():
+            if column_name not in task_columns:
+                connection.execute(text(f"ALTER TABLE tasks ADD COLUMN {column_name} {ddl}"))
+        for column_name, ddl in run_additions.items():
+            if column_name not in run_columns:
+                connection.execute(text(f"ALTER TABLE runs ADD COLUMN {column_name} {ddl}"))

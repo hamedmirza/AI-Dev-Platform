@@ -1,19 +1,20 @@
 
 from datetime import datetime
+from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator
 
 
 class TaskCreate(BaseModel):
     title: str = Field(min_length=3, max_length=255)
-    description: str | None = Field(default=None, min_length=10)
-    workspace_path: str | None = None
-    task_type: str | None = None
+    description: Optional[str] = Field(default=None, min_length=10)
+    workspace_path: Optional[str] = None
+    task_type: Optional[str] = None
     constraints: list[str] = Field(default_factory=list)
     target_files: list[str] = Field(default_factory=list)
-    provider: str | None = None
-    model: str | None = None
-    request_text: str | None = Field(default=None, min_length=10)
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    request_text: Optional[str] = Field(default=None, min_length=10)
 
     @model_validator(mode="after")
     def validate_request_fields(self) -> "TaskCreate":
@@ -51,4 +52,5 @@ class TaskCreate(BaseModel):
 class TaskCreated(BaseModel):
     task_id: str
     run_id: str
+    request_id: Optional[str] = None
     created_at: datetime

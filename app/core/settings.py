@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     )
     lmstudio_api_key: str = Field(default="lm-studio", alias="LMSTUDIO_API_KEY")
     provider_timeout_seconds: float = Field(default=60.0, alias="PROVIDER_TIMEOUT_SECONDS")
+    planner_stage_timeout_seconds: float = Field(
+        default=45.0,
+        alias="PLANNER_STAGE_TIMEOUT_SECONDS",
+    )
+    planner_stage_max_retries: int = Field(default=2, alias="PLANNER_STAGE_MAX_RETRIES")
 
     workspace_root: str = Field(default="./workspace", alias="WORKSPACE_ROOT")
     source_repo_path: Optional[str] = Field(default=None, alias="SOURCE_REPO_PATH")

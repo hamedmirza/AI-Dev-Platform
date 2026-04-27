@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import subprocess
 from pathlib import Path
 
@@ -39,11 +41,21 @@ def run_validation_command(
         return CommandResult(
             command=command,
             returncode=124,
-            stdout=exc.stdout or "",
-            stderr=exc.stderr or f"Command timed out after {timeout_seconds} seconds.",
+            stdout=_normalize_output(exc.stdout),
+            stderr=_normalize_output(
+                exc.stderr or f"Command timed out after {timeout_seconds} seconds."
+            ),
             timed_out=True,
         )
 
 
 def _is_allowed_command(command: list[str]) -> bool:
     return any(command[: len(prefix)] == list(prefix) for prefix in ALLOWED_VALIDATION_COMMANDS)
+
+
+def _normalize_output(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value

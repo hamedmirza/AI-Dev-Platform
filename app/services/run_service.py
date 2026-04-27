@@ -6,8 +6,13 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import RunStage, RunStatus
 from app.core.exceptions import WorkflowError
-from app.db.models import RunEventModel, RunModel
-from app.schemas.run import RunEventResponse, RunResponse
+from app.db.models import RunEventModel, RunModel, RunStateSnapshotModel
+from app.schemas.run import (
+    RunEventResponse,
+    RunResponse,
+    RunStateSnapshotResponse,
+    TaskSummaryResponse,
+)
 from app.services.repository_service import (
     cleanup_run_workspace,
     commit_run_workspace,
@@ -19,15 +24,36 @@ def get_run(session: Session, run_id: str) -> Optional[RunResponse]:
     model = session.get(RunModel, run_id)
     if model is None:
         return None
+    latest_state_model = session.scalars(
+        select(RunStateSnapshotModel)
+        .where(RunStateSnapshotModel.run_id == run_id)
+        .order_by(RunStateSnapshotModel.id.desc())
+        .limit(1)
+    ).first()
     return RunResponse(
         id=model.id,
         task_id=model.task_id,
         status=model.status,
         current_stage=model.current_stage,
         provider_name=model.provider_name,
+        request_id=model.request_id,
+        retry_count=model.retry_count,
         error_message=model.error_message,
         created_at=model.created_at,
         updated_at=model.updated_at,
+        task=TaskSummaryResponse(
+            id=model.task.id,
+            title=model.task.title,
+            description=model.task.description,
+            workspace_path=model.task.workspace_path,
+            task_type=model.task.task_type,
+            constraints=model.task.constraints,
+            target_files=model.task.target_files,
+            provider_override=model.task.provider_override,
+            model_override=model.task.model_override,
+            request_text=model.task.request_text,
+        ),
+        latest_state=_to_snapshot_response(latest_state_model),
     )
 
 
@@ -45,6 +71,20 @@ def get_run_history(session: Session, run_id: str) -> list[RunEventResponse]:
         )
         for item in events
     ]
+
+
+def get_run_state_snapshots(session: Session, run_id: str) -> list[RunStateSnapshotResponse]:
+    snapshots = session.scalars(
+        select(RunStateSnapshotModel)
+        .where(RunStateSnapshotModel.run_id == run_id)
+        .order_by(RunStateSnapshotModel.id.asc())
+    ).all()
+    responses: list[RunStateSnapshotResponse] = []
+    for item in snapshots:
+        response = _to_snapshot_response(item)
+        if response is not None:
+            responses.append(response)
+    return responses
 
 
 def _record_event(
@@ -135,6 +175,7 @@ def retry_run(session: Session, run_id: str, note: Optional[str] = None) -> RunR
     run.status = RunStatus.PENDING
     run.current_stage = RunStage.INTAKE
     run.error_message = None
+    run.retry_count = 0
     _record_event(session, run, "operator_retried", note or "Operator retried the run.")
     session.commit()
     result = get_run(session, run_id)
@@ -144,3 +185,18 @@ def retry_run(session: Session, run_id: str, note: Optional[str] = None) -> RunR
 
 def cleanup_workspace(run_id: str) -> dict[str, object]:
     return cleanup_run_workspace(run_id)
+
+
+def _to_snapshot_response(
+    model: Optional[RunStateSnapshotModel],
+) -> Optional[RunStateSnapshotResponse]:
+    if model is None:
+        return None
+    return RunStateSnapshotResponse(
+        id=model.id,
+        stage=model.stage,
+        status=model.status,
+        retry_count=model.retry_count,
+        payload_json=model.payload_json,
+        created_at=model.created_at,
+    )

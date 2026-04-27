@@ -1,4 +1,5 @@
 
+import json
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
@@ -19,9 +20,24 @@ class TaskModel(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     title: Mapped[str] = mapped_column(String(255))
     request_text: Mapped[str] = mapped_column(Text)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    workspace_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    task_type: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    constraints_json: Mapped[str] = mapped_column(Text, default="[]")
+    target_files_json: Mapped[str] = mapped_column(Text, default="[]")
+    provider_override: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    model_override: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     runs: Mapped[list["RunModel"]] = relationship(back_populates="task")
+
+    @property
+    def constraints(self) -> list[str]:
+        return _decode_json_list(self.constraints_json)
+
+    @property
+    def target_files(self) -> list[str]:
+        return _decode_json_list(self.target_files_json)
 
 
 class RunModel(Base):
@@ -32,6 +48,8 @@ class RunModel(Base):
     status: Mapped[str] = mapped_column(String(64), index=True)
     current_stage: Mapped[str] = mapped_column(String(64))
     provider_name: Mapped[str] = mapped_column(String(64))
+    request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
@@ -46,6 +64,10 @@ class RunModel(Base):
         cascade="all, delete-orphan",
     )
     artifacts: Mapped[list["ArtifactModel"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    state_snapshots: Mapped[list["RunStateSnapshotModel"]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
     )
@@ -76,3 +98,27 @@ class ArtifactModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     run: Mapped[RunModel] = relationship(back_populates="artifacts")
+
+
+class RunStateSnapshotModel(Base):
+    __tablename__ = "run_state_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
+    stage: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    payload_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    run: Mapped[RunModel] = relationship(back_populates="state_snapshots")
+
+
+def _decode_json_list(raw_value: str) -> list[str]:
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [str(item) for item in payload]

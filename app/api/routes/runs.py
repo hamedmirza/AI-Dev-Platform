@@ -27,6 +27,7 @@ from app.services.run_service import (
     cleanup_workspace,
     get_run,
     get_run_history,
+    get_run_state_snapshots,
     reject_run,
     retry_run,
 )
@@ -45,6 +46,11 @@ def fetch_run(run_id: str, session: Session = Depends(get_db)):
 @router.get("/runs/{run_id}/history", dependencies=[Depends(require_api_token)])
 def fetch_run_history(run_id: str, session: Session = Depends(get_db)):
     return get_run_history(session, run_id)
+
+
+@router.get("/runs/{run_id}/state-snapshots", dependencies=[Depends(require_api_token)])
+def fetch_run_state_snapshots(run_id: str, session: Session = Depends(get_db)):
+    return get_run_state_snapshots(session, run_id)
 
 
 @router.get("/runs/{run_id}/artifacts", dependencies=[Depends(require_api_token)])

@@ -4,4 +4,4 @@ from app.schemas.provider import ProviderHealthResponse
 
 
 def get_provider_health() -> ProviderHealthResponse:
-    return get_provider().healthcheck()
+    return get_provider().health_check()

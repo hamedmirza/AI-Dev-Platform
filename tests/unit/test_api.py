@@ -2,6 +2,8 @@ import json
 import subprocess
 import time
 from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 
@@ -14,7 +16,12 @@ from app.services.orchestration_service import reset_orchestration_service
 
 
 class FakeProvider(BaseProvider):
+    def __init__(self) -> None:
+        self.review_failures_remaining = 0
+        self.test_failures_remaining = 0
+
     def invoke_json(self, system_prompt: str, user_prompt: str) -> str:
+        payload: dict[str, Any]
         prompt = f"{system_prompt}\n{user_prompt}".lower()
         if "summary, assumptions, risks, steps" in prompt:
             payload = {
@@ -24,6 +31,12 @@ class FakeProvider(BaseProvider):
                 "steps": ["Inspect current code", "Propose changes", "Validate outputs"],
                 "acceptance_criteria": ["Routes respond", "Artifacts are stored"],
             }
+        elif "changed_files" in prompt:
+            payload = {
+                "changed_files": ["app/api/main.py", "app/services/orchestration_service.py"],
+                "implementation_notes": ["Create a runnable backend skeleton."],
+                "requires_operator_approval": True,
+            }
         elif "touched_modules" in prompt:
             payload = {
                 "touched_modules": ["app/api", "app/services"],
@@ -31,25 +44,36 @@ class FakeProvider(BaseProvider):
                 "dependency_notes": [],
                 "migration_notes": [],
             }
-        elif "changed_files" in prompt:
-            payload = {
-                "changed_files": ["app/api/main.py", "app/services/orchestration_service.py"],
-                "implementation_notes": ["Create a runnable backend skeleton."],
-                "requires_operator_approval": True,
-            }
         elif "approved" in prompt:
-            payload = {
-                "approved": True,
-                "summary": "Change set is acceptable.",
-                "issues": [],
-            }
+            if self.review_failures_remaining > 0:
+                self.review_failures_remaining -= 1
+                payload = {
+                    "approved": False,
+                    "summary": "Change set still needs revision.",
+                    "issues": ["Address the unresolved review issue."],
+                }
+            else:
+                payload = {
+                    "approved": True,
+                    "summary": "Change set is acceptable.",
+                    "issues": [],
+                }
         else:
-            payload = {
-                "passed": True,
-                "summary": "Validation strategy accepted.",
-                "commands": ["pytest"],
-                "failures": [],
-            }
+            if self.test_failures_remaining > 0:
+                self.test_failures_remaining -= 1
+                payload = {
+                    "passed": False,
+                    "summary": "Validation failed on the current proposal.",
+                    "commands": ["pytest"],
+                    "failures": ["Fix the failing validation case."],
+                }
+            else:
+                payload = {
+                    "passed": True,
+                    "summary": "Validation strategy accepted.",
+                    "commands": ["pytest"],
+                    "failures": [],
+                }
         return json.dumps(payload)
 
     def healthcheck(self) -> ProviderHealthResponse:
@@ -61,7 +85,19 @@ class FakeProvider(BaseProvider):
         )
 
 
-def build_client(tmp_path: Path, monkeypatch) -> TestClient:
+class SlowPlannerProvider(FakeProvider):
+    def invoke_json(self, system_prompt: str, user_prompt: str) -> str:
+        prompt = f"{system_prompt}\n{user_prompt}".lower()
+        if "summary, assumptions, risks, steps" in prompt:
+            time.sleep(0.2)
+        return super().invoke_json(system_prompt, user_prompt)
+
+
+def build_client(
+    tmp_path: Path,
+    monkeypatch,
+    provider: Optional[BaseProvider] = None,
+) -> TestClient:
     db_path = tmp_path / "test.db"
     workspace_root = tmp_path / "workspace"
     backup_root = tmp_path / "backups"
@@ -95,11 +131,30 @@ def build_client(tmp_path: Path, monkeypatch) -> TestClient:
 
     clear_settings_cache()
     reset_orchestration_service()
-    set_provider_override(FakeProvider())
+    set_provider_override(provider or FakeProvider())
 
     from app.api.main import create_app
 
     return TestClient(create_app())
+
+
+def wait_for_run_status(
+    client: TestClient,
+    run_id: str,
+    headers: dict[str, str],
+    expected_statuses: set[str],
+) -> str:
+    status = ""
+    for _ in range(60):
+        run_response = client.get(f"/api/runs/{run_id}", headers=headers)
+        assert run_response.status_code == 200
+        status = run_response.json()["status"]
+        if status in expected_statuses:
+            return status
+        time.sleep(0.05)
+    raise AssertionError(
+        f"Run {run_id} did not reach one of {expected_statuses}; last status={status}"
+    )
 
 
 def test_health_endpoint(tmp_path: Path, monkeypatch) -> None:
@@ -108,6 +163,7 @@ def test_health_endpoint(tmp_path: Path, monkeypatch) -> None:
         response = client.get("/api/health")
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
+        assert response.headers["x-request-id"]
 
         provider = client.get("/api/health/provider")
         assert provider.status_code == 200
@@ -139,21 +195,31 @@ def test_task_run_reaches_awaiting_approval(tmp_path: Path, monkeypatch) -> None
         )
         assert response.status_code == 200
         created = response.json()
+        assert response.headers["x-request-id"]
+        assert created["request_id"] == response.headers["x-request-id"]
 
         run_id = created["run_id"]
-        for _ in range(40):
-            run_response = client.get(f"/api/runs/{run_id}", headers=headers)
-            assert run_response.status_code == 200
-            status = run_response.json()["status"]
-            if status in {"awaiting_approval", "failed", "needs_revision"}:
-                break
-            time.sleep(0.05)
-
+        status = wait_for_run_status(
+            client,
+            run_id,
+            headers,
+            {"awaiting_approval", "failed", "review_required", "blocked"},
+        )
         assert status == "awaiting_approval"
 
         history = client.get(f"/api/runs/{run_id}/history", headers=headers)
         assert history.status_code == 200
         assert any(item["event_type"] == "awaiting_approval" for item in history.json())
+
+        run_summary = client.get(f"/api/runs/{run_id}", headers=headers)
+        assert run_summary.status_code == 200
+        assert run_summary.json()["task"]["title"] == "Implement backend runtime"
+        assert run_summary.json()["request_id"] == created["request_id"]
+        assert run_summary.json()["latest_state"] is not None
+
+        snapshots = client.get(f"/api/runs/{run_id}/state-snapshots", headers=headers)
+        assert snapshots.status_code == 200
+        assert any(item["stage"] == "planner" for item in snapshots.json())
 
         artifacts = client.get(f"/api/runs/{run_id}/artifacts", headers=headers)
         assert artifacts.status_code == 200
@@ -198,7 +264,7 @@ def test_task_run_reaches_awaiting_approval(tmp_path: Path, monkeypatch) -> None
             json={"note": "Retry locally"},
         )
         assert retry.status_code == 200
-        assert retry.json()["status"] == "queued"
+        assert retry.json()["status"] == "pending"
 
 
 def test_config_requires_authentication(tmp_path: Path, monkeypatch) -> None:
@@ -226,12 +292,10 @@ def test_approve_and_backup_flow(tmp_path: Path, monkeypatch) -> None:
         assert response.status_code == 200
         run_id = response.json()["run_id"]
 
-        for _ in range(40):
-            run_response = client.get(f"/api/runs/{run_id}", headers=headers)
-            assert run_response.status_code == 200
-            if run_response.json()["status"] == "awaiting_approval":
-                break
-            time.sleep(0.05)
+        assert (
+            wait_for_run_status(client, run_id, headers, {"awaiting_approval", "failed", "blocked"})
+            == "awaiting_approval"
+        )
 
         workspace_file = tmp_path / "workspace" / f"run-{run_id}" / "README.md"
         workspace_file.write_text("fixture repo\ncommitted\n", encoding="utf-8")
@@ -285,7 +349,16 @@ def test_ui_login_dashboard_and_run_detail(tmp_path: Path, monkeypatch) -> None:
             follow_redirects=False,
         )
         assert created.status_code == 303
-        run_location = created.headers["location"]
+        dashboard_location = created.headers["location"]
+        assert dashboard_location.startswith("/ui?")
+        parsed = parse_qs(urlparse(dashboard_location).query)
+        run_id = parsed["created_run_id"][0]
+        run_location = f"/ui/runs/{run_id}"
+
+        dashboard_after = client.get(dashboard_location)
+        assert dashboard_after.status_code == 200
+        assert run_id in dashboard_after.text
+        assert "Task created." in dashboard_after.text
 
         for _ in range(40):
             detail = client.get(run_location)
@@ -294,17 +367,19 @@ def test_ui_login_dashboard_and_run_detail(tmp_path: Path, monkeypatch) -> None:
                 break
             time.sleep(0.05)
 
-        run_id = run_location.rsplit("/", 1)[-1]
         workspace_file = tmp_path / "workspace" / f"run-{run_id}" / "README.md"
         workspace_file.write_text("fixture repo\nui diff\n", encoding="utf-8")
 
         detail = client.get(run_location)
         assert "Timeline" in detail.text
+        assert "Task Metadata" in detail.text
+        assert "State Snapshots" in detail.text
         assert "Artifacts" in detail.text
         assert "Code Review Panel" in detail.text
         assert "Workspace Diff" in detail.text
         assert "README.md" in detail.text
         assert "Workspace Files" in detail.text
+        assert "<textarea name=\"content\"" in detail.text
 
         save_file = client.post(
             f"/ui/runs/{run_id}/files/save",
@@ -337,3 +412,163 @@ def test_ui_login_dashboard_and_run_detail(tmp_path: Path, monkeypatch) -> None:
             follow_redirects=False,
         )
         assert saved.status_code == 303
+        saved_page = client.get(saved.headers["location"])
+        assert saved_page.status_code == 200
+        assert "Settings saved." in saved_page.text
+
+
+def test_ui_run_actions_do_not_500_on_invalid_state(tmp_path: Path, monkeypatch) -> None:
+    client = build_client(tmp_path, monkeypatch)
+
+    with client:
+        login = client.post("/ui/login", data={"token": "test-token"}, follow_redirects=False)
+        assert login.status_code == 303
+
+        created = client.post(
+            "/ui/tasks",
+            data={
+                "title": "UI action safety run",
+                "request_text": "Create run so action buttons can be exercised safely.",
+            },
+            follow_redirects=False,
+        )
+        assert created.status_code == 303
+        parsed = parse_qs(urlparse(created.headers["location"]).query)
+        run_id = parsed["created_run_id"][0]
+
+        approve = client.post(
+            f"/ui/runs/{run_id}/approve",
+            data={"note": "should not crash"},
+            follow_redirects=False,
+        )
+        assert approve.status_code == 303
+        assert "error=" in approve.headers["location"]
+
+        reject = client.post(
+            f"/ui/runs/{run_id}/reject",
+            data={"note": "should not crash"},
+            follow_redirects=False,
+        )
+        assert reject.status_code == 303
+        assert "error=" in reject.headers["location"]
+
+        detail = client.get(approve.headers["location"])
+        assert detail.status_code == 200
+        assert "Run is not awaiting approval." in detail.text
+
+        approve_get = client.get(f"/ui/runs/{run_id}/approve", follow_redirects=False)
+        assert approve_get.status_code == 303
+        reject_get = client.get(f"/ui/runs/{run_id}/reject", follow_redirects=False)
+        assert reject_get.status_code == 303
+        approve_alias = client.get(f"/runs/{run_id}/approve", follow_redirects=False)
+        assert approve_alias.status_code == 303
+        reject_alias = client.get(f"/runs/{run_id}/reject", follow_redirects=False)
+        assert reject_alias.status_code == 303
+
+
+def test_review_retries_reach_blocked_state(tmp_path: Path, monkeypatch) -> None:
+    provider = FakeProvider()
+    provider.review_failures_remaining = 3
+    client = build_client(tmp_path, monkeypatch, provider=provider)
+    headers = {"x-api-token": "test-token"}
+
+    with client:
+        response = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "title": "Reviewer retry path",
+                "description": "Exercise the reviewer rejection loop until the run blocks.",
+                "workspace_path": "/tmp/repo",
+                "constraints": ["Do not ship unresolved review items."],
+                "target_files": ["app/services/orchestration_service.py"],
+                "provider": "lmstudio",
+                "model": "review-model",
+            },
+        )
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+
+        assert (
+            wait_for_run_status(client, run_id, headers, {"blocked", "awaiting_approval"})
+            == "blocked"
+        )
+
+        history = client.get(f"/api/runs/{run_id}/history", headers=headers)
+        assert history.status_code == 200
+        event_types = [item["event_type"] for item in history.json()]
+        assert event_types.count("review_rejected") == 3
+        assert "run_blocked" in event_types
+
+        run_summary = client.get(f"/api/runs/{run_id}", headers=headers)
+        assert run_summary.status_code == 200
+        assert run_summary.json()["task"]["workspace_path"] == "/tmp/repo"
+        assert run_summary.json()["task"]["provider_override"] == "lmstudio"
+        assert run_summary.json()["task"]["model_override"] == "review-model"
+
+
+def test_validation_retries_reach_blocked_state(tmp_path: Path, monkeypatch) -> None:
+    provider = FakeProvider()
+    provider.test_failures_remaining = 3
+    client = build_client(tmp_path, monkeypatch, provider=provider)
+    headers = {"x-api-token": "test-token"}
+
+    with client:
+        response = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "title": "Validation retry path",
+                "description": "Exercise the validation retry loop until the run blocks.",
+                "task_type": "bugfix",
+            },
+        )
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+
+        assert (
+            wait_for_run_status(client, run_id, headers, {"blocked", "awaiting_approval"})
+            == "blocked"
+        )
+
+        history = client.get(f"/api/runs/{run_id}/history", headers=headers)
+        assert history.status_code == 200
+        event_types = [item["event_type"] for item in history.json()]
+        assert event_types.count("tests_failed") == 3
+        assert "run_blocked" in event_types
+
+        snapshots = client.get(f"/api/runs/{run_id}/state-snapshots", headers=headers)
+        assert snapshots.status_code == 200
+        assert any(item["status"] == "blocked" for item in snapshots.json())
+
+
+def test_planner_timeout_retries_then_fails(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PLANNER_STAGE_TIMEOUT_SECONDS", "0.05")
+    monkeypatch.setenv("PLANNER_STAGE_MAX_RETRIES", "1")
+    provider = SlowPlannerProvider()
+    client = build_client(tmp_path, monkeypatch, provider=provider)
+    headers = {"x-api-token": "test-token"}
+
+    with client:
+        response = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "title": "Planner timeout guard",
+                "request_text": "Exercise planner timeout guard behavior.",
+            },
+        )
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+
+        assert (
+            wait_for_run_status(client, run_id, headers, {"failed", "awaiting_approval"})
+            == "failed"
+        )
+
+        history = client.get(f"/api/runs/{run_id}/history", headers=headers)
+        assert history.status_code == 200
+        event_types = [item["event_type"] for item in history.json()]
+        assert event_types.count("planner_timeout") >= 1
+        assert "planner_retry" in event_types
+        assert "planner_failed" in event_types

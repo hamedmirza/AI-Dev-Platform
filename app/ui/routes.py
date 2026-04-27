@@ -2,11 +2,14 @@ import json
 from html import escape
 from pathlib import Path
 from typing import Optional, cast
+from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
+from app.core.exceptions import WorkflowError
 from app.core.settings import get_settings
 from app.db.models import RunModel
 from app.db.session import get_session_factory
@@ -29,6 +32,7 @@ from app.services.run_service import (
     cleanup_workspace,
     get_run,
     get_run_history,
+    get_run_state_snapshots,
     reject_run,
     retry_run,
 )
@@ -110,21 +114,25 @@ def _action_form(action: str, label: str, css_class: str = "") -> str:
     )
 
 
-def _render_runs(runs: list[RunModel]) -> str:
+def _render_runs(runs: list[RunModel], highlighted_run_id: Optional[str] = None) -> str:
     if not runs:
         return '<div class="item"><div class="meta">No runs yet.</div></div>'
 
     rendered = []
     for run in runs:
+        run_title = str(run.task.title) if run.task is not None else "Untitled task"
+        is_highlighted = highlighted_run_id == run.id
+        border_style = " style=\"border:1px solid #d0a44e;\"" if is_highlighted else ""
         rendered.append(
             f"""
-            <div class="item">
+            <div class="item"{border_style}>
               <div class="section-head">
                 <h2 style="font-size: 1rem; margin: 0;">
                   <a href="/ui/runs/{escape(run.id)}">{escape(run.id)}</a>
                 </h2>
                 {status_badge(str(run.status))}
               </div>
+              <div class="meta">{escape(run_title)}</div>
               <div class="pill-row">
                 <span class="pill">stage: {escape(str(run.current_stage))}</span>
                 <span class="pill">provider: {escape(str(run.provider_name))}</span>
@@ -243,24 +251,25 @@ def _render_diff_panel(run_id: str) -> str:
 def _render_workspace_editor(run_id: str, selected_path: Optional[str]) -> str:
     workspace = list_run_workspace_files(run_id)
     files = cast(list[str], workspace["files"])
+    selected = selected_path or (files[0] if files else None)
     files_html = "".join(
-        f'<a class="nav-link{" active" if item == selected_path else ""}" '
+        f'<a class="nav-link{" active" if item == selected else ""}" '
         f'href="/ui/runs/{escape(run_id)}?file={escape(item)}">{escape(item)}</a>'
         for item in files
     ) or '<div class="item"><div class="meta">No files available in the workspace.</div></div>'
 
     content = ""
-    if selected_path:
+    if selected:
         try:
-            content = str(read_run_workspace_file(run_id, selected_path)["content"])
+            content = str(read_run_workspace_file(run_id, selected)["content"])
         except Exception:
             content = ""
 
     editor = ""
-    if selected_path:
+    if selected:
         editor = f"""
         <form method="post" action="/ui/runs/{escape(run_id)}/files/save">
-          <input type="hidden" name="path" value="{escape(selected_path)}">
+          <input type="hidden" name="path" value="{escape(selected)}">
           <textarea name="content" style="min-height: 320px;" required>{escape(content)}</textarea>
           <button type="submit">Save File</button>
         </form>
@@ -295,7 +304,10 @@ def ui_root(request: Request):
     session = get_session_factory()()
     try:
         runs = session.scalars(
-            select(RunModel).order_by(RunModel.created_at.desc()).limit(12),
+            select(RunModel)
+            .options(selectinload(RunModel.task))
+            .order_by(RunModel.created_at.desc())
+            .limit(12),
         ).all()
     finally:
         session.close()
@@ -310,7 +322,22 @@ def ui_root(request: Request):
     repo_dirty = escape(str(repository["dirty"]))
     repo_branch = escape(str(repository["branch"]))
 
+    page_error = request.query_params.get("error")
+    page_success = request.query_params.get("success")
+    created_run_id = request.query_params.get("created_run_id")
+    error_html = (
+        f'<section class="panel"><div class="meta" style="color:#9f3a2d;">{escape(page_error)}</div></section>'
+        if page_error
+        else ""
+    )
+    success_html = (
+        f'<section class="panel"><div class="meta" style="color:#2d6a3a;">{escape(page_success)}</div></section>'
+        if page_success
+        else ""
+    )
     body = f"""
+    {error_html}
+    {success_html}
     <section class="panel hero">
       <div class="eyebrow">Operator Overview</div>
       <h2>Local operations console for planning, run control, and recovery.</h2>
@@ -332,6 +359,12 @@ def ui_root(request: Request):
         </div>
         <form method="post" action="/ui/tasks">
           <input type="text" name="title" placeholder="Run title" required>
+          <input type="text" name="workspace_path" placeholder="Workspace path (optional)">
+          <input type="text" name="task_type" placeholder="Task type (optional)">
+          <input type="text" name="target_files" placeholder="Target files, comma-separated">
+          <input type="text" name="constraints" placeholder="Constraints, comma-separated">
+          <input type="text" name="provider" placeholder="Provider override (optional)">
+          <input type="text" name="model" placeholder="Model override (optional)">
           <textarea
             name="request_text"
             placeholder="Describe the software task in detail."
@@ -356,7 +389,7 @@ def ui_root(request: Request):
       <div class="section-head">
         <h2>Recent Runs</h2>
       </div>
-      <div class="list">{_render_runs(runs)}</div>
+      <div class="list">{_render_runs(runs, highlighted_run_id=created_run_id)}</div>
     </section>
     """
     html = layout(
@@ -482,7 +515,14 @@ def settings_page(request: Request):
         return redirect
 
     settings = get_settings()
+    page_success = request.query_params.get("success")
+    success_html = (
+        f'<section class="panel"><div class="meta" style="color:#2d6a3a;">{escape(page_success)}</div></section>'
+        if page_success
+        else ""
+    )
     body = f"""
+    {success_html}
     <section class="panel hero">
       <div class="eyebrow">Settings</div>
       <h2>Edit local runtime overrides for this repo.</h2>
@@ -544,7 +584,7 @@ def settings_submit(
             "LOG_LEVEL": LOG_LEVEL,
         }
     )
-    response = RedirectResponse("/ui/settings", status_code=303)
+    response = RedirectResponse("/ui/settings?success=Settings+saved.", status_code=303)
     if APP_API_TOKEN != request.cookies.get("operator_token"):
         response.set_cookie("operator_token", APP_API_TOKEN, httponly=True, samesite="lax")
     return response
@@ -626,7 +666,17 @@ def logout():
 
 
 @router.post("/ui/tasks")
-def create_task_ui(request: Request, title: str = Form(...), request_text: str = Form(...)):
+def create_task_ui(
+    request: Request,
+    title: str = Form(...),
+    request_text: str = Form(...),
+    workspace_path: str = Form(default=""),
+    task_type: str = Form(default=""),
+    target_files: str = Form(default=""),
+    constraints: str = Form(default=""),
+    provider: str = Form(default=""),
+    model: str = Form(default=""),
+):
     redirect = _require_authorized(request)
     if redirect:
         return redirect
@@ -635,18 +685,37 @@ def create_task_ui(request: Request, title: str = Form(...), request_text: str =
     try:
         task = create_task_and_run(
             session,
-            TaskCreate(title=title, request_text=request_text),
-            provider_name="ui-submitted",
+            TaskCreate(
+                title=title,
+                request_text=request_text,
+                workspace_path=workspace_path or None,
+                task_type=task_type or None,
+                target_files=_split_csv(target_files),
+                constraints=_split_csv(constraints),
+                provider=provider or None,
+                model=model or None,
+            ),
+            provider_name=provider or "ui-submitted",
         )
-    finally:
+    except Exception as exc:
         session.close()
+        return RedirectResponse(f"/ui?error={quote_plus(str(exc))}", status_code=303)
+    finally:
+        if session.is_active:
+            session.close()
 
     get_orchestration_service().enqueue_run(task.run_id)
-    return RedirectResponse(f"/ui/runs/{task.run_id}", status_code=303)
+    return RedirectResponse(
+        f"/ui?success=Task+created.&created_run_id={quote_plus(task.run_id)}",
+        status_code=303,
+    )
 
 
-def _run_action_redirect(run_id: str) -> RedirectResponse:
-    return RedirectResponse(f"/ui/runs/{run_id}", status_code=303)
+def _run_action_redirect(run_id: str, error: Optional[str] = None) -> RedirectResponse:
+    location = f"/ui/runs/{run_id}"
+    if error:
+        location += f"?error={quote_plus(error)}"
+    return RedirectResponse(location, status_code=303)
 
 
 @router.post("/ui/runs/{run_id}/approve")
@@ -657,9 +726,16 @@ def approve_ui(request: Request, run_id: str, note: str = Form(default="")):
     session = get_session_factory()()
     try:
         approve_run(session, run_id, note or None)
+    except WorkflowError as exc:
+        return _run_action_redirect(run_id, str(exc))
     finally:
         session.close()
     return _run_action_redirect(run_id)
+
+
+@router.get("/ui/runs/{run_id}/approve")
+def approve_ui_get(run_id: str):
+    return _run_action_redirect(run_id, "Use the approve button to submit this action.")
 
 
 @router.post("/ui/runs/{run_id}/reject")
@@ -670,9 +746,26 @@ def reject_ui(request: Request, run_id: str, note: str = Form(default="")):
     session = get_session_factory()()
     try:
         reject_run(session, run_id, note or None)
+    except WorkflowError as exc:
+        return _run_action_redirect(run_id, str(exc))
     finally:
         session.close()
     return _run_action_redirect(run_id)
+
+
+@router.get("/ui/runs/{run_id}/reject")
+def reject_ui_get(run_id: str):
+    return _run_action_redirect(run_id, "Use the reject button to submit this action.")
+
+
+@router.get("/runs/{run_id}/approve")
+def approve_alias_get(run_id: str):
+    return _run_action_redirect(run_id, "Use /ui/runs/{id} actions from the run detail page.")
+
+
+@router.get("/runs/{run_id}/reject")
+def reject_alias_get(run_id: str):
+    return _run_action_redirect(run_id, "Use /ui/runs/{id} actions from the run detail page.")
 
 
 @router.post("/ui/runs/{run_id}/retry")
@@ -683,6 +776,8 @@ def retry_ui(request: Request, run_id: str, note: str = Form(default="")):
     session = get_session_factory()()
     try:
         retry_run(session, run_id, note or None)
+    except WorkflowError as exc:
+        return _run_action_redirect(run_id, str(exc))
     finally:
         session.close()
     get_orchestration_service().enqueue_run(run_id)
@@ -697,6 +792,8 @@ def abort_ui(request: Request, run_id: str, note: str = Form(default="")):
     session = get_session_factory()()
     try:
         abort_run(session, run_id, note or None)
+    except WorkflowError as exc:
+        return _run_action_redirect(run_id, str(exc))
     finally:
         session.close()
     return _run_action_redirect(run_id)
@@ -707,7 +804,10 @@ def cleanup_ui(request: Request, run_id: str):
     redirect = _require_authorized(request)
     if redirect:
         return redirect
-    cleanup_workspace(run_id)
+    try:
+        cleanup_workspace(run_id)
+    except Exception as exc:
+        return _run_action_redirect(run_id, str(exc))
     return _run_action_redirect(run_id)
 
 
@@ -721,7 +821,10 @@ def save_workspace_file_ui(
     redirect = _require_authorized(request)
     if redirect:
         return redirect
-    write_run_workspace_file(run_id, path, content)
+    try:
+        write_run_workspace_file(run_id, path, content)
+    except Exception as exc:
+        return _run_action_redirect(run_id, str(exc))
     return RedirectResponse(f"/ui/runs/{run_id}?file={path}", status_code=303)
 
 
@@ -738,6 +841,7 @@ def run_detail(request: Request, run_id: str):
             return HTMLResponse(page("Run Not Found", "<p>Run not found.</p>"), status_code=404)
         history = get_run_history(session, run_id)
         artifacts = list_artifacts(session, run_id)
+        snapshots = get_run_state_snapshots(session, run_id)
     finally:
         session.close()
 
@@ -770,12 +874,32 @@ def run_detail(request: Request, run_id: str):
         )
         or '<div class="item"><div class="meta">No artifacts recorded yet.</div></div>'
     )
+    snapshots_html = (
+        "".join(
+            (
+                '<div class="item">'
+                f"<h4>{escape(item.stage)} / {escape(item.status)}</h4>"
+                f'<div class="meta">retry_count={escape(str(item.retry_count))}</div>'
+                f"<pre>{escape(item.payload_json)}</pre>"
+                "</div>"
+            )
+            for item in snapshots[-6:]
+        )
+        or '<div class="item"><div class="meta">No state snapshots recorded yet.</div></div>'
+    )
     code_change_panel = _render_code_change_panel(artifacts)
     diff_panel = _render_diff_panel(run_id)
     workspace_editor = _render_workspace_editor(run_id, selected_file)
     auto_refresh = run.status in {"pending", "running"}
 
+    page_error = request.query_params.get("error")
+    error_html = (
+        f'<section class="panel"><div class="meta" style="color:#9f3a2d;">{escape(page_error)}</div></section>'
+        if page_error
+        else ""
+    )
     body = f"""
+    {error_html}
     <section class="panel hero">
       <div class="eyebrow">Run Detail</div>
       <h2>Run {escape(run.id)}</h2>
@@ -787,6 +911,23 @@ def run_detail(request: Request, run_id: str):
         {status_badge(str(run.status))}
         <span class="pill">stage: {escape(str(run.current_stage))}</span>
         <span class="pill">provider: {escape(str(run.provider_name))}</span>
+        <span class="pill">request: {escape(str(run.request_id or "-"))}</span>
+        <span class="pill">retries: {escape(str(run.retry_count))}</span>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="section-head">
+        <h2>Task Metadata</h2>
+      </div>
+      <div class="list">
+        {_item("Title", str(run.task.title))}
+        {_item("Description", str(run.task.description or run.task.request_text))}
+        {_item("Workspace", str(run.task.workspace_path or "-"))}
+        {_item("Task Type", str(run.task.task_type or "-"))}
+        {_item("Constraints", ", ".join(run.task.constraints) or "-")}
+        {_item("Target Files", ", ".join(run.task.target_files) or "-")}
+        {_item("Provider Override", str(run.task.provider_override or "-"))}
+        {_item("Model Override", str(run.task.model_override or "-"))}
       </div>
     </section>
     <section class="panel">
@@ -810,8 +951,18 @@ def run_detail(request: Request, run_id: str):
         <div class="list">{history_html}</div>
       </section>
       <section class="panel">
+        <div class="section-head"><h2>State Snapshots</h2></div>
+        <div class="list">{snapshots_html}</div>
+      </section>
+    </div>
+    <div class="wide-grid">
+      <section class="panel">
         <div class="section-head"><h2>Artifacts</h2></div>
         <div class="list">{artifact_html}</div>
+      </section>
+      <section class="panel">
+        <div class="section-head"><h2>Task Prompt</h2></div>
+        <pre>{escape(run.task.request_text)}</pre>
       </section>
     </div>
     {code_change_panel}
@@ -837,6 +988,10 @@ def backup_ui(request: Request):
         return redirect
     create_backup()
     return RedirectResponse("/ui/backups", status_code=303)
+
+
+def _split_csv(raw_value: str) -> list[str]:
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
 
 
 @router.post("/ui/backups/restore-rehearsal")
