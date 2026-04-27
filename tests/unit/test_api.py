@@ -33,9 +33,16 @@ class FakeProvider(BaseProvider):
             }
         elif "changed_files" in prompt:
             payload = {
-                "changed_files": ["app/api/main.py", "app/services/orchestration_service.py"],
-                "implementation_notes": ["Create a runnable backend skeleton."],
+                "changed_files": ["README.md"],
+                "implementation_notes": ["Apply a small workspace change."],
                 "requires_operator_approval": True,
+                "file_changes": [
+                    {
+                        "path": "README.md",
+                        "content": "fixture repo\nupdated by ai\n",
+                        "change_type": "upsert",
+                    }
+                ],
             }
         elif "touched_modules" in prompt:
             payload = {
@@ -112,7 +119,17 @@ def build_client(
     source_repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-b", "main"], cwd=source_repo, check=True, capture_output=True)
     (source_repo / "README.md").write_text("fixture repo\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=source_repo, check=True, capture_output=True)
+    (source_repo / "tests").mkdir()
+    (source_repo / "tests" / "test_smoke.py").write_text(
+        "def test_smoke():\n    assert True\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "README.md", "tests"],
+        cwd=source_repo,
+        check=True,
+        capture_output=True,
+    )
     subprocess.run(
         [
             "git",
@@ -224,9 +241,17 @@ def test_task_run_reaches_awaiting_approval(tmp_path: Path, monkeypatch) -> None
         artifacts = client.get(f"/api/runs/{run_id}/artifacts", headers=headers)
         assert artifacts.status_code == 200
         artifact_types = {item["artifact_type"] for item in artifacts.json()}
-        assert artifact_types == {"plan", "architecture", "code_change", "review", "test_result"}
+        assert {"plan", "architecture", "code_change", "review", "test_result", "log"}.issubset(
+            artifact_types
+        )
+
+        history_events = [item["event_type"] for item in history.json()]
+        assert "code_patch_applied" in history_events
+        assert "validation_commands_completed" in history_events
 
         workspace_file = tmp_path / "workspace" / f"run-{run_id}" / "README.md"
+        assert workspace_file.read_text(encoding="utf-8") == "fixture repo\nupdated by ai\n"
+
         workspace_file.write_text("fixture repo\nmodified\n", encoding="utf-8")
 
         diff = client.get(f"/api/runs/{run_id}/diff", headers=headers)
@@ -253,6 +278,13 @@ def test_task_run_reaches_awaiting_approval(tmp_path: Path, monkeypatch) -> None
         )
         assert read_back.status_code == 200
         assert "saved via api" in read_back.json()["content"]
+
+        unsafe_write = client.post(
+            f"/api/runs/{run_id}/workspace/file",
+            headers=headers,
+            json={"path": ".git/config", "content": "unsafe"},
+        )
+        assert unsafe_write.status_code == 409
 
         cleanup = client.post(f"/api/runs/{run_id}/cleanup-workspace", headers=headers)
         assert cleanup.status_code == 200

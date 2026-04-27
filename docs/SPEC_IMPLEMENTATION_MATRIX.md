@@ -8,6 +8,7 @@ Status legend:
 ## Core objective
 - `[x]` accept software tasks -> `app/api/routes/tasks.py`, `app/ui/routes.py`, `app/schemas/task.py`
 - `[x]` generate plans/architecture/code/review/test artifacts -> `app/services/orchestration_service.py`, `app/schemas/plan.py`, `app/schemas/architecture.py`, `app/schemas/code_change.py`, `app/schemas/review.py`, `app/schemas/test_result.py`
+- `[x]` apply AI-generated code patches in isolated run workspaces -> `app/schemas/code_change.py`, `app/services/orchestration_service.py`, `app/services/repository_service.py`
 - `[x]` loop on failures until escalation/completion -> `app/services/orchestration_service.py`
 - `[x]` expose API + UI workflow -> `app/api/main.py`, `app/api/routes/*.py`, `app/ui/routes.py`, `app/ui/render.py`
 - `[x]` local-first LM Studio support -> `app/providers/lmstudio.py`, `app/providers/registry.py`, `app/providers/health.py`
@@ -54,7 +55,7 @@ Status legend:
 - `[x]` run IDs in log context -> `app/core/request_context.py`, `app/core/logging.py`, `app/services/orchestration_service.py`
 - `[x]` step-level/node start-end logs/events -> `app/services/orchestration_service.py`, `app/db/models.py` (`RunEventModel`)
 - `[x]` provider latency logging -> `app/providers/lmstudio.py` (`structured_completion`, `health_check`)
-- `[~]` validation command execution logs -> command wrappers return structured results, but orchestration does not yet emit dedicated validation command logs
+- `[x]` validation command execution logs -> command wrappers return structured results and orchestration stores validation events/artifacts
 
 ## Tests requirement coverage
 - `[x]` end-to-end run flow tests (API/UI) -> `tests/unit/test_api.py`

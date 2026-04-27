@@ -59,6 +59,8 @@ Core:
 - operator dashboard, repository view, provider view, settings view, backups view
 - task submission and background run processing
 - run timeline, artifacts, code-review summary, and workspace diff view
+- structured AI-generated file changes applied inside isolated run workspaces
+- local validation command execution from the tester stage using the command whitelist
 - spec-aligned task payloads with optional workspace path, constraints, target files, provider, and model overrides
 - reviewer/test retry loops with blocked-state escalation after configured thresholds
 - persisted run state snapshots and richer run/task metadata in API responses
@@ -115,5 +117,5 @@ curl -H "x-api-token: $APP_API_TOKEN" "http://127.0.0.1:8400/api/runs/<run_id>/s
 
 ## Next Steps
 1. Add first-class provider adapters beyond LM Studio using the same provider interface.
-2. Add provider latency and validation command summaries as explicit artifacts in run history.
-3. Expand integration/E2E suites to include multi-run concurrency and restart recovery scenarios.
+2. Expand integration/E2E suites to include multi-run concurrency and restart recovery scenarios.
+3. Add richer patch formats for partial file edits beyond whole-file upsert/delete operations.

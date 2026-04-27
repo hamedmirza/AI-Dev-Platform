@@ -18,4 +18,5 @@
 ## Local Operator Flow
 - Create a run from `/ui`.
 - Inspect timeline, artifacts, and workspace diff from `/ui/runs/{run_id}`.
+- Review the applied AI patch and local validation command artifact before approval.
 - Approve, reject, retry, abort, or clean up the workspace from the run screen.

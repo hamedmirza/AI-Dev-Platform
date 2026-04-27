@@ -1,13 +1,22 @@
 
-from pydantic import BaseModel, field_validator
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas._coerce import as_bool, as_string_list
+
+
+class FileChange(BaseModel):
+    path: str
+    content: str = ""
+    change_type: Literal["upsert", "delete"] = "upsert"
 
 
 class CodeChangeResponse(BaseModel):
     changed_files: list[str]
     implementation_notes: list[str]
     requires_operator_approval: bool = True
+    file_changes: list[FileChange] = Field(default_factory=list)
 
     @field_validator("changed_files", "implementation_notes", mode="before")
     @classmethod

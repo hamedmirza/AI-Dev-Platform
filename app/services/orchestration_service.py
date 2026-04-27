@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import shlex
 import subprocess
 import sys
 import threading
@@ -16,7 +17,7 @@ from typing import Optional, cast
 from pydantic import BaseModel
 
 from app.core.enums import ArtifactType, ProviderStatus, RunStage, RunStatus, StringEnum
-from app.core.exceptions import ProviderError
+from app.core.exceptions import ConfigurationError, ProviderError
 from app.core.request_context import set_request_id, set_run_id
 from app.core.settings import get_settings
 from app.db.models import ArtifactModel, RunEventModel, RunModel, RunStateSnapshotModel, TaskModel
@@ -24,11 +25,19 @@ from app.db.session import get_session_factory
 from app.graph.state import WorkflowState
 from app.providers.registry import get_provider, resolve_provider
 from app.schemas.architecture import ArchitectureResponse
-from app.schemas.code_change import CodeChangeResponse
+from app.schemas.code_change import CodeChangeResponse, FileChange
 from app.schemas.plan import PlanResponse
 from app.schemas.review import ReviewResponse
 from app.schemas.test_result import TestResultResponse
-from app.services.repository_service import create_run_workspace
+from app.services.repository_service import (
+    create_run_workspace,
+    delete_run_workspace_file,
+    get_run_workspace_diff,
+    get_run_workspace_path,
+    write_run_workspace_file,
+)
+from app.tools.base import CommandResult
+from app.tools.command_runner import run_validation_command
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +90,9 @@ STAGES: list[StageDefinition] = [
         schema=CodeChangeResponse,
         system_prompt_path="app/agents/prompts/coder.md",
         user_prompt_template=(
-            "Return JSON with changed_files, implementation_notes, and "
-            "requires_operator_approval for this task:\n\n{request_text}"
+            "Return JSON with changed_files, implementation_notes, requires_operator_approval, "
+            "and file_changes for this task. file_changes must contain actual workspace edits "
+            "as objects with path, content, and change_type upsert/delete:\n\n{request_text}"
         ),
     ),
     StageDefinition(
@@ -138,7 +148,7 @@ class OrchestrationService:
     def stop(self) -> None:
         self._stop_event.set()
         if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=2)
+            self._worker_thread.join(timeout=30)
 
     def enqueue_run(self, run_id: str) -> None:
         self._queue.put(run_id)
@@ -234,6 +244,7 @@ class OrchestrationService:
                     self._run_stage(session, run, provider, coder_stage, coder_prompt),
                 )
                 workflow_state["code_output"] = code_model.model_dump_json()
+                self._apply_code_changes(session, run, code_model)
 
                 review_prompt = self._build_review_request(task.request_text, retry_feedback)
                 review_model = cast(
@@ -275,11 +286,16 @@ class OrchestrationService:
                     TestResultResponse,
                     self._run_stage(session, run, provider, tester_stage, test_prompt),
                 )
+                local_validation_passed, local_failures = self._run_local_validation(
+                    session,
+                    run,
+                    test_model,
+                )
                 workflow_state["test_output"] = test_model.model_dump_json()
-                if not test_model.passed:
+                if not test_model.passed or not local_validation_passed:
                     test_retries += 1
                     total_retries += 1
-                    retry_feedback = [test_model.summary, *test_model.failures]
+                    retry_feedback = [test_model.summary, *test_model.failures, *local_failures]
                     run.retry_count = total_retries
                     workflow_state["retry_count"] = total_retries
                     workflow_state["errors"] = retry_feedback
@@ -392,6 +408,160 @@ class OrchestrationService:
         )
         session.commit()
         return model
+
+    def _apply_code_changes(
+        self,
+        session,
+        run: RunModel,
+        code_model: CodeChangeResponse,
+    ) -> None:
+        if not code_model.file_changes:
+            self._add_event(
+                session,
+                run.id,
+                "code_patch_skipped",
+                "Coder response did not include file_changes; no workspace files were modified.",
+            )
+            session.commit()
+            return
+
+        applied = []
+        for file_change in code_model.file_changes:
+            applied.append(self._apply_file_change(run.id, file_change))
+
+        diff = get_run_workspace_diff(run.id)
+        self._add_event(
+            session,
+            run.id,
+            "code_patch_applied",
+            f"Applied {len(applied)} AI-generated file change(s) to the run workspace.",
+            json.dumps({"applied": applied, "changed_files": diff["changed_files"]}, indent=2),
+        )
+        session.add(
+            self._make_log_artifact(
+                run.id,
+                "Applied code patch",
+                {
+                    "applied": applied,
+                    "diff": diff,
+                },
+            )
+        )
+        session.commit()
+
+    def _apply_file_change(self, run_id: str, file_change: FileChange) -> dict[str, object]:
+        if file_change.change_type == "delete":
+            result = delete_run_workspace_file(run_id, file_change.path)
+            return {
+                "path": file_change.path,
+                "change_type": file_change.change_type,
+                "deleted": bool(result["deleted"]),
+            }
+
+        write_run_workspace_file(run_id, file_change.path, file_change.content)
+        return {
+            "path": file_change.path,
+            "change_type": file_change.change_type,
+            "bytes": len(file_change.content.encode("utf-8")),
+        }
+
+    def _run_local_validation(
+        self,
+        session,
+        run: RunModel,
+        test_model: TestResultResponse,
+    ) -> tuple[bool, list[str]]:
+        commands = self._validation_commands(test_model.commands, get_run_workspace_path(run.id))
+        if not commands:
+            self._add_event(
+                session,
+                run.id,
+                "validation_skipped",
+                "Tester response did not include runnable validation commands.",
+            )
+            session.commit()
+            return True, []
+
+        results: list[dict[str, object]] = []
+        failures: list[str] = []
+        for command in commands:
+            try:
+                result = run_validation_command(command, cwd=get_run_workspace_path(run.id))
+            except ConfigurationError as exc:
+                results.append(
+                    {
+                        "command": command,
+                        "returncode": 126,
+                        "stdout": "",
+                        "stderr": str(exc),
+                        "timed_out": False,
+                    }
+                )
+                failures.append(str(exc))
+                continue
+
+            payload = self._command_result_payload(result)
+            results.append(payload)
+            if result.returncode != 0:
+                failures.append(
+                    f"{' '.join(result.command)} failed with exit code {result.returncode}."
+                )
+
+        passed = not failures
+        self._add_event(
+            session,
+            run.id,
+            "validation_commands_completed",
+            "Local validation commands completed." if passed else "Local validation failed.",
+            json.dumps({"passed": passed, "results": results}, indent=2),
+        )
+        session.add(
+            self._make_log_artifact(
+                run.id,
+                "Local validation commands",
+                {"passed": passed, "results": results},
+            )
+        )
+        session.commit()
+        return passed, failures
+
+    def _validation_commands(self, commands: list[str], workspace_path: Path) -> list[list[str]]:
+        parsed = [shlex.split(command) for command in commands if command.strip()]
+        if parsed:
+            return parsed
+
+        if (workspace_path / "pyproject.toml").exists():
+            return [["ruff", "check", "."], ["mypy", "app"], ["pytest", "-q"]]
+        return []
+
+    def _command_result_payload(self, result: CommandResult) -> dict[str, object]:
+        return {
+            "command": result.command,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "timed_out": result.timed_out,
+        }
+
+    def _make_log_artifact(
+        self,
+        run_id: str,
+        title: str,
+        payload: dict[str, object],
+    ) -> ArtifactModel:
+        settings = get_settings()
+        content = json.dumps(payload, indent=2)
+        truncated = False
+        if len(content) > settings.artifact_char_limit:
+            content = content[: settings.artifact_char_limit] + "\n... [truncated]"
+            truncated = True
+        return ArtifactModel(
+            run_id=run_id,
+            artifact_type=ArtifactType.LOG,
+            title=title,
+            content=content,
+            truncated=truncated,
+        )
 
     def _should_block(
         self,

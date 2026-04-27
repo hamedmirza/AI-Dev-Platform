@@ -47,6 +47,13 @@ def run_validation_command(
             ),
             timed_out=True,
         )
+    except FileNotFoundError as exc:
+        return CommandResult(
+            command=command,
+            returncode=127,
+            stdout="",
+            stderr=str(exc),
+        )
 
 
 def _is_allowed_command(command: list[str]) -> bool:

@@ -45,11 +45,19 @@ def test_other_stage_models_coerce_lists_and_bools() -> None:
             "changed_files": {"path": "README.md", "reason": "note"},
             "implementation_notes": "small tweak",
             "requires_operator_approval": "yes",
+            "file_changes": [
+                {
+                    "path": "README.md",
+                    "content": "updated\n",
+                    "change_type": "upsert",
+                }
+            ],
         }
     )
     assert code.changed_files == ["README.md: note"]
     assert code.implementation_notes == ["small tweak"]
     assert code.requires_operator_approval is True
+    assert code.file_changes[0].path == "README.md"
 
     review = ReviewResponse.model_validate(
         {"approved": "false", "summary": "Needs edits", "issues": "schema mismatch"}

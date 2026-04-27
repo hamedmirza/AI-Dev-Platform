@@ -20,6 +20,7 @@ from app.tools.git_tools import (
     list_workspace_files,
     validate_git_repository,
 )
+from app.tools.workspace_guard import ensure_within_root
 
 
 def get_repository_summary() -> dict[str, object]:
@@ -84,6 +85,7 @@ def list_run_workspace_files(run_id: str) -> dict[str, object]:
 
 
 def read_run_workspace_file(run_id: str, relative_path: str) -> dict[str, object]:
+    _ensure_safe_workspace_path(relative_path)
     workspace_path = get_run_workspace_path(run_id)
     content = read_text_file(workspace_path, relative_path)
     return {
@@ -95,6 +97,7 @@ def read_run_workspace_file(run_id: str, relative_path: str) -> dict[str, object
 
 
 def write_run_workspace_file(run_id: str, relative_path: str, content: str) -> dict[str, object]:
+    _ensure_safe_workspace_path(relative_path)
     workspace_path = get_run_workspace_path(run_id)
     write_text_file(workspace_path, relative_path, content)
     return {
@@ -103,6 +106,29 @@ def write_run_workspace_file(run_id: str, relative_path: str, content: str) -> d
         "path": relative_path,
         "content": content,
     }
+
+
+def delete_run_workspace_file(run_id: str, relative_path: str) -> dict[str, object]:
+    _ensure_safe_workspace_path(relative_path)
+    workspace_path = get_run_workspace_path(run_id)
+    path = ensure_within_root(workspace_path / relative_path, workspace_path)
+    if path.exists() and path.is_file():
+        path.unlink()
+        deleted = True
+    else:
+        deleted = False
+    return {
+        "run_id": run_id,
+        "workspace_path": str(workspace_path),
+        "path": relative_path,
+        "deleted": deleted,
+    }
+
+
+def _ensure_safe_workspace_path(relative_path: str) -> None:
+    path = Path(relative_path)
+    if path.is_absolute() or not relative_path.strip() or ".git" in path.parts:
+        raise ConfigurationError(f"Workspace path is not editable: {relative_path}")
 
 
 def commit_run_workspace(run_id: str, message: str) -> dict[str, object]:
