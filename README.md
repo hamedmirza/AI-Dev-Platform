@@ -11,6 +11,12 @@ This repo is now a working local-first software delivery platform with:
 - LM Studio via OpenAI-compatible API
 - pytest / ruff / mypy
 
+## Source repository
+
+- **GitHub:** [github.com/hamedmirza/AI-Dev-Platform](https://github.com/hamedmirza/AI-Dev-Platform)
+- **Clone:** `git clone https://github.com/hamedmirza/AI-Dev-Platform.git`
+- Set `SOURCE_REPO_PATH` in `.env` to the **absolute path** of your local checkout so run workspaces clone from the intended tree (see [Environment Variables](#environment-variables)).
+
 ## Architecture Diagram (Text)
 ```text
 User/API/UI
@@ -42,7 +48,7 @@ Core:
 - `LMSTUDIO_MODEL` (default: `qwen2.5-coder-14b-instruct`)
 - `LMSTUDIO_API_KEY` (default: `lm-studio`)
 - `PROVIDER_TIMEOUT_SECONDS` (default: `60`)
-- `SOURCE_REPO_PATH` (path to repository to clone into run workspaces)
+- `SOURCE_REPO_PATH` (absolute path to this repo’s checkout on disk; used when cloning into run workspaces)
 - `WORKSPACE_ROOT` (default: `./workspace`)
 - `BACKUP_ROOT` (default: `./backups`)
 - `LOG_LEVEL` (default: `INFO`)

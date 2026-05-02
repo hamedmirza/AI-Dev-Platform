@@ -1,5 +1,6 @@
 import shutil
 from pathlib import Path
+from typing import Optional, cast
 
 from app.core.exceptions import ConfigurationError
 from app.core.settings import get_settings
@@ -148,14 +149,25 @@ def commit_run_workspace(run_id: str, message: str) -> dict[str, object]:
     }
 
 
+def _origin_fetch_url(remotes: list[str]) -> Optional[str]:
+    """Return the fetch URL for the `origin` remote, if present."""
+    for line in remotes:
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "origin" and parts[-1] == "(fetch)":
+            return parts[1]
+    return None
+
+
 def get_repository_config_snapshot() -> dict[str, object]:
     settings = get_settings()
     repo_summary = get_repository_summary()
+    remotes = cast(list[str], repo_summary["remotes"])
     return {
         "source_repo_path": repo_summary["path"],
         "default_branch": repo_summary["branch"],
         "workspace_root": str(settings.workspace_root_path),
         "head_sha": repo_summary["head_sha"],
-        "remotes": repo_summary["remotes"],
+        "remotes": remotes,
+        "origin_fetch_url": _origin_fetch_url(remotes),
         "dirty": repo_summary["dirty"],
     }
