@@ -10,6 +10,7 @@ def next_stage(current_stage: str, current_status: str) -> str:
         RunStage.INTAKE.value,
         RunStage.PLANNER.value,
         RunStage.ARCHITECT.value,
+        RunStage.UI_DESIGNER.value,
         RunStage.CODER.value,
         RunStage.REVIEWER.value,
         RunStage.TESTER.value,

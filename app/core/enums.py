@@ -21,6 +21,7 @@ class RunStage(StringEnum):
     INTAKE = "intake"
     PLANNER = "planner"
     ARCHITECT = "architect"
+    UI_DESIGNER = "ui_designer"
     CODER = "coder"
     REVIEWER = "reviewer"
     TESTER = "tester"
@@ -31,6 +32,7 @@ class RunStage(StringEnum):
 class ArtifactType(StringEnum):
     PLAN = "plan"
     ARCHITECTURE = "architecture"
+    UI_DESIGN = "ui_design"
     CODE_CHANGE = "code_change"
     REVIEW = "review"
     TEST_RESULT = "test_result"

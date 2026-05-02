@@ -38,7 +38,7 @@ from app.services.run_service import (
 )
 from app.services.settings_service import load_local_settings, save_local_settings
 from app.services.task_service import create_task_and_run
-from app.ui.render import layout, page, page_with_auto_refresh, status_badge
+from app.ui.render import layout, page, page_with_auto_refresh, react_app_shell, status_badge
 
 router = APIRouter(include_in_schema=False)
 
@@ -300,6 +300,7 @@ def ui_root(request: Request):
     redirect = _require_authorized(request)
     if redirect:
         return redirect
+    return HTMLResponse(react_app_shell("Operator Console"))
 
     session = get_session_factory()()
     try:
@@ -407,6 +408,7 @@ def repository_page(request: Request):
     redirect = _require_authorized(request)
     if redirect:
         return redirect
+    return HTMLResponse(react_app_shell("Repository"))
 
     repository = get_repository_summary()
     remotes = cast(list[str], repository["remotes"])
@@ -459,6 +461,7 @@ def provider_page(request: Request):
     redirect = _require_authorized(request)
     if redirect:
         return redirect
+    return HTMLResponse(react_app_shell("Provider"))
 
     settings = get_settings()
     provider = get_provider_health()
@@ -513,6 +516,7 @@ def settings_page(request: Request):
     redirect = _require_authorized(request)
     if redirect:
         return redirect
+    return HTMLResponse(react_app_shell("Settings"))
 
     settings = get_settings()
     page_success = request.query_params.get("success")
@@ -566,12 +570,14 @@ def settings_submit(
     redirect = _require_authorized(request)
     if redirect:
         return redirect
+    current_token = get_settings().app_api_token
+    next_token = current_token if APP_API_TOKEN == "__UNCHANGED__" else APP_API_TOKEN
 
     save_local_settings(
         {
             "APP_HOST": APP_HOST,
             "APP_PORT": APP_PORT,
-            "APP_API_TOKEN": APP_API_TOKEN,
+            "APP_API_TOKEN": next_token,
             "LMSTUDIO_BASE_URL": LMSTUDIO_BASE_URL,
             "LMSTUDIO_MODEL": LMSTUDIO_MODEL,
             "LMSTUDIO_API_KEY": LMSTUDIO_API_KEY,
@@ -585,8 +591,8 @@ def settings_submit(
         }
     )
     response = RedirectResponse("/ui/settings?success=Settings+saved.", status_code=303)
-    if APP_API_TOKEN != request.cookies.get("operator_token"):
-        response.set_cookie("operator_token", APP_API_TOKEN, httponly=True, samesite="lax")
+    if next_token != request.cookies.get("operator_token"):
+        response.set_cookie("operator_token", next_token, httponly=True, samesite="lax")
     return response
 
 
@@ -595,6 +601,7 @@ def backups_page(request: Request):
     redirect = _require_authorized(request)
     if redirect:
         return redirect
+    return HTMLResponse(react_app_shell("Backups"))
 
     body = f"""
     <section class="panel hero">
@@ -833,6 +840,7 @@ def run_detail(request: Request, run_id: str):
     redirect = _require_authorized(request)
     if redirect:
         return redirect
+    return HTMLResponse(react_app_shell(f"Run {run_id}"))
 
     session = get_session_factory()()
     try:

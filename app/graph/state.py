@@ -16,6 +16,7 @@ class WorkflowState(TypedDict, total=False):
     current_step: str
     planner_output: str
     architecture_output: str
+    ui_design_output: str
     code_output: str
     review_output: str
     test_output: str

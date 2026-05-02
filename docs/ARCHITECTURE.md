@@ -10,6 +10,7 @@ Orchestration Service
 LangGraph Workflow
    ├─ Planner Agent
    ├─ Architect Agent
+   ├─ UI Designer Agent
    ├─ Coder Agent
    ├─ Reviewer Agent
    └─ Tester Agent

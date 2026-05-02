@@ -1,5 +1,5 @@
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.api.routes.config import require_api_token
@@ -28,11 +28,20 @@ from app.services.run_service import (
     get_run,
     get_run_history,
     get_run_state_snapshots,
+    list_runs,
     reject_run,
     retry_run,
 )
 
 router = APIRouter(tags=["runs"])
+
+
+@router.get("/runs", dependencies=[Depends(require_api_token)])
+def fetch_runs(
+    limit: int = Query(default=12, ge=1, le=100),
+    session: Session = Depends(get_db),
+):
+    return list_runs(session, limit=limit)
 
 
 @router.get("/runs/{run_id}", dependencies=[Depends(require_api_token)])

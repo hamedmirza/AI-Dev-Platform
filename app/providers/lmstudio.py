@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 class LMStudioProvider(BaseProvider):
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._client = httpx.Client(
+            timeout=self.settings.provider_timeout_seconds,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            headers={"Connection": "keep-alive"},
+        )
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.settings.lmstudio_api_key}"}
@@ -30,7 +35,14 @@ class LMStudioProvider(BaseProvider):
             raise ProviderError(f"Unsupported provider override: {provider_name}")
         if not model_name:
             return self
-        return LMStudioProvider(self.settings.model_copy(update={"lmstudio_model": model_name}))
+        new_provider = LMStudioProvider(
+            self.settings.model_copy(update={"lmstudio_model": model_name})
+        )
+        try:
+            self._client.close()
+        except Exception:
+            pass
+        return new_provider
 
     def invoke_json(self, system_prompt: str, user_prompt: str) -> str:
         return self.structured_completion(system_prompt, user_prompt)
@@ -63,16 +75,15 @@ class LMStudioProvider(BaseProvider):
         }
         started = time.perf_counter()
         try:
-            with httpx.Client(timeout=self.settings.provider_timeout_seconds) as client:
-                response = client.post(url, headers=self._headers(), json=payload_with_json)
-                if response.status_code == 400:
-                    logger.warning(
-                        "lmstudio response_format rejected; "
-                        "retrying without response_format model=%s",
-                        self.settings.lmstudio_model,
-                    )
-                    response = client.post(url, headers=self._headers(), json=payload_fallback)
-                response.raise_for_status()
+            response = self._client.post(url, headers=self._headers(), json=payload_with_json)
+            if response.status_code == 400:
+                logger.warning(
+                    "lmstudio response_format rejected; "
+                    "retrying without response_format model=%s",
+                    self.settings.lmstudio_model,
+                )
+                response = self._client.post(url, headers=self._headers(), json=payload_fallback)
+            response.raise_for_status()
         except httpx.HTTPError as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000
             logger.warning(
@@ -103,9 +114,8 @@ class LMStudioProvider(BaseProvider):
         url = f"{self.settings.lmstudio_base_url.rstrip('/')}/models"
         started = time.perf_counter()
         try:
-            with httpx.Client(timeout=min(self.settings.provider_timeout_seconds, 10.0)) as client:
-                response = client.get(url, headers=self._headers())
-                response.raise_for_status()
+            response = self._client.get(url, headers=self._headers())
+            response.raise_for_status()
             data = response.json()
             elapsed_ms = (time.perf_counter() - started) * 1000
             logger.info("lmstudio health_check ok latency_ms=%.2f", elapsed_ms)
@@ -136,9 +146,8 @@ class LMStudioProvider(BaseProvider):
     def list_models(self) -> list[str]:
         url = f"{self.settings.lmstudio_base_url.rstrip('/')}/models"
         try:
-            with httpx.Client(timeout=min(self.settings.provider_timeout_seconds, 10.0)) as client:
-                response = client.get(url, headers=self._headers())
-                response.raise_for_status()
+            response = self._client.get(url, headers=self._headers())
+            response.raise_for_status()
             data = response.json()
             return sorted(
                 [str(item.get("id")) for item in data.get("data", []) if isinstance(item, dict)]

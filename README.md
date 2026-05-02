@@ -4,6 +4,7 @@ This repo is now a working local-first software delivery platform with:
 
 - FastAPI
 - server-rendered operator UI
+- React/Vite operator console served by FastAPI after build
 - background run orchestration
 - Pydantic v2
 - SQLite
@@ -60,6 +61,7 @@ Core:
 - task submission and background run processing
 - run timeline, artifacts, code-review summary, and workspace diff view
 - structured AI-generated file changes applied inside isolated run workspaces
+- dedicated UI designer agent that creates modern frontend direction before coding
 - local validation command execution from the tester stage using the command whitelist
 - spec-aligned task payloads with optional workspace path, constraints, target files, provider, and model overrides
 - reviewer/test retry loops with blocked-state escalation after configured thresholds
@@ -67,6 +69,16 @@ Core:
 - request ID propagation on HTTP responses and contextual request/run logging
 - local backup creation and restore rehearsal
 - local repository workspace cloning and cleanup
+
+## Frontend Build
+The production UI is a standalone React/Vite bundle served by FastAPI from `/ui`.
+
+```bash
+npm --prefix frontend install
+npm --prefix frontend run typecheck
+npm --prefix frontend run build
+bash scripts/dev_start.sh
+```
 
 ## API Usage Examples
 Create task:

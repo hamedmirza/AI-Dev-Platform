@@ -1,4 +1,6 @@
+import json
 from html import escape
+from pathlib import Path
 
 
 def page(title: str, body: str) -> str:
@@ -9,36 +11,69 @@ def page(title: str, body: str) -> str:
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{escape(title)}</title>
     <style>
+      @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap");
       :root {{
-        --bg: #f4f6f8;
-        --bg-soft: #e8eef2;
-        --panel: rgba(255, 255, 255, 0.92);
-        --panel-strong: #ffffff;
-        --ink: #0f172a;
-        --ink-soft: #1e293b;
-        --muted: #4b5563;
-        --line: #d7dee8;
-        --line-strong: #c5d0dc;
-        --accent: #0f4c81;
-        --accent-strong: #0b3c69;
-        --accent-soft: rgba(15, 76, 129, 0.1);
-        --accent-glow: rgba(15, 76, 129, 0.18);
-        --warn: #9a5e11;
-        --danger: #b42318;
-        --ok: #067647;
-        --radius: 16px;
-        --shadow: 0 20px 46px rgba(15, 23, 42, 0.08);
-        --shadow-soft: 0 10px 26px rgba(15, 23, 42, 0.05);
+        --bg-base: #f5f7ff;
+        --bg-alt: #eaf2ff;
+        --ink: #142037;
+        --ink-soft: #243451;
+        --muted: #617089;
+        --line: #d7deef;
+        --line-strong: #c2cbe1;
+        --panel: rgba(255, 255, 255, 0.87);
+        --panel-strong: rgba(255, 255, 255, 0.98);
+        --radius: 14px;
+        --accent: #0358d8;
+        --accent-strong: #003ea6;
+        --accent-soft: rgba(3, 88, 216, 0.14);
+        --accent-glow: rgba(3, 88, 216, 0.3);
+        --ok: #0d855f;
+        --warn: #a86d00;
+        --danger: #c1323f;
+        --shadow: 0 20px 46px rgba(17, 34, 68, 0.12);
+        --shadow-soft: 0 8px 18px rgba(17, 34, 68, 0.09);
       }}
       * {{ box-sizing: border-box; }}
       body {{
         margin: 0;
-        font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+        font-family: "Inter", "Segoe UI", sans-serif;
         background:
-          radial-gradient(circle at 0% 0%, rgba(15, 76, 129, 0.09), transparent 28%),
-          radial-gradient(circle at 100% 0%, rgba(6, 118, 71, 0.08), transparent 24%),
-          linear-gradient(180deg, #f9fbfc 0%, var(--bg) 42%, var(--bg-soft) 100%);
+          radial-gradient(85rem 42rem at -10% -20%, rgba(3, 88, 216, 0.2), transparent 48%),
+          radial-gradient(70rem 40rem at 108% -5%, rgba(15, 133, 95, 0.2), transparent 46%),
+          linear-gradient(180deg, #f8faff 0%, var(--bg-base) 52%, var(--bg-alt) 100%);
         color: var(--ink);
+        min-height: 100vh;
+      }}
+      body::before {{
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image: repeating-linear-gradient(
+          135deg,
+          rgba(20, 32, 55, 0.03) 0,
+          rgba(20, 32, 55, 0.03) 1px,
+          transparent 1px,
+          transparent 12px
+        );
+        opacity: 0.52;
+        z-index: 0;
+      }}
+      .global-ribbon {{
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        z-index: 20;
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--accent-glow);
+        background: rgba(255, 255, 255, 0.95);
+        color: var(--accent-strong);
+        font-size: 0.76rem;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        box-shadow: 0 8px 22px rgba(3, 62, 166, 0.2);
       }}
       a {{
         color: var(--accent-strong);
@@ -49,7 +84,9 @@ def page(title: str, body: str) -> str:
       .shell {{
         max-width: 1320px;
         margin: 0 auto;
-        padding: 28px 22px 56px;
+        padding: 30px 24px 56px;
+        position: relative;
+        z-index: 1;
       }}
       .masthead {{
         display: flex;
@@ -57,19 +94,18 @@ def page(title: str, body: str) -> str:
         align-items: center;
         gap: 22px;
         margin-bottom: 26px;
-        padding: 18px 22px;
-        border: 1px solid var(--line);
-        border-radius: calc(var(--radius) + 2px);
-        background: linear-gradient(
-          115deg,
-          rgba(255, 255, 255, 0.88),
-          rgba(255, 255, 255, 0.74)
-        );
+        padding: 18px 22px 19px;
+        border: 1px solid rgba(3, 88, 216, 0.16);
+        border-radius: calc(var(--radius) + 6px);
+        background:
+          linear-gradient(120deg, rgba(255, 255, 255, 0.95), rgba(237, 246, 255, 0.85));
         box-shadow: var(--shadow-soft);
-        backdrop-filter: blur(8px);
+        backdrop-filter: blur(10px);
+        animation: rise-in 360ms ease both, glow-in 480ms ease both;
       }}
       .title {{
-        font-size: 2rem;
+        font-family: "Space Grotesk", "Inter", sans-serif;
+        font-size: 2.05rem;
         line-height: 1.05;
         margin: 0 0 4px;
         letter-spacing: -0.02em;
@@ -78,6 +114,21 @@ def page(title: str, body: str) -> str:
         margin: 0;
         color: var(--muted);
         font-size: 0.93rem;
+      }}
+      .build-tag {{
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(3, 88, 216, 0.24);
+        background: var(--accent-soft);
+        color: var(--accent-strong);
+        font-size: 0.74rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
       }}
       .layout {{
         display: grid;
@@ -100,10 +151,10 @@ def page(title: str, body: str) -> str:
       }}
       .nav-link {{
         display: block;
-        padding: 10px 12px;
+        padding: 10px 12px 11px;
         border-radius: 12px;
         border: 1px solid var(--line);
-        background: rgba(255, 255, 255, 0.7);
+        background: rgba(255, 255, 255, 0.73);
         color: var(--ink-soft);
         transition: all 140ms ease;
       }}
@@ -117,6 +168,7 @@ def page(title: str, body: str) -> str:
         background: var(--accent-soft);
         color: var(--accent-strong);
         font-weight: 700;
+        box-shadow: inset 0 0 0 1px rgba(3, 88, 216, 0.18);
       }}
       .grid {{
         display: grid;
@@ -134,11 +186,12 @@ def page(title: str, body: str) -> str:
       }}
       .panel {{
         background: var(--panel);
-        border: 1px solid var(--line);
+        border: 1px solid rgba(3, 88, 216, 0.12);
         border-radius: var(--radius);
         padding: 18px 18px 16px;
         box-shadow: var(--shadow);
         backdrop-filter: blur(8px);
+        animation: rise-in 440ms ease both;
       }}
       .panel h2, .panel h3 {{
         margin: 0 0 11px;
@@ -156,10 +209,10 @@ def page(title: str, body: str) -> str:
         gap: 11px;
       }}
       .metric {{
-        border: 1px solid var(--line);
+        border: 1px solid rgba(3, 88, 216, 0.14);
         border-radius: 12px;
         padding: 12px;
-        background: rgba(255, 255, 255, 0.74);
+        background: rgba(255, 255, 255, 0.86);
         color: var(--muted);
         font-size: 0.84rem;
       }}
@@ -171,7 +224,7 @@ def page(title: str, body: str) -> str:
       }}
       .status {{
         display: inline-block;
-        padding: 4px 10px 5px;
+        padding: 4px 10px 6px;
         border-radius: 999px;
         font-size: 0.77rem;
         font-weight: 700;
@@ -181,18 +234,18 @@ def page(title: str, body: str) -> str:
       }}
       .status.ok {{
         color: var(--ok);
-        border-color: rgba(6, 118, 71, 0.3);
-        background: rgba(6, 118, 71, 0.06);
+        border-color: rgba(13, 133, 95, 0.33);
+        background: rgba(13, 133, 95, 0.08);
       }}
       .status.warn {{
         color: var(--warn);
-        border-color: rgba(154, 94, 17, 0.32);
-        background: rgba(154, 94, 17, 0.07);
+        border-color: rgba(168, 109, 0, 0.3);
+        background: rgba(168, 109, 0, 0.08);
       }}
       .status.bad {{
         color: var(--danger);
-        border-color: rgba(180, 35, 24, 0.3);
-        background: rgba(180, 35, 24, 0.06);
+        border-color: rgba(193, 50, 63, 0.31);
+        background: rgba(193, 50, 63, 0.08);
       }}
       form {{ display: grid; gap: 10px; }}
       input, textarea, button {{
@@ -200,7 +253,7 @@ def page(title: str, body: str) -> str:
       }}
       input, textarea {{
         width: 100%;
-        border: 1px solid var(--line);
+        border: 1px solid var(--line-strong);
         border-radius: 10px;
         padding: 10px 11px;
         background: var(--panel-strong);
@@ -209,13 +262,13 @@ def page(title: str, body: str) -> str:
       input:focus, textarea:focus {{
         outline: none;
         border-color: var(--accent-glow);
-        box-shadow: 0 0 0 3px rgba(15, 76, 129, 0.12);
+        box-shadow: 0 0 0 3px rgba(3, 88, 216, 0.2);
       }}
       textarea {{ min-height: 140px; resize: vertical; }}
       button {{
         border: 0;
         border-radius: 999px;
-        padding: 10px 15px;
+        padding: 10px 16px;
         font-weight: 700;
         letter-spacing: 0.01em;
         background: var(--accent);
@@ -225,7 +278,7 @@ def page(title: str, body: str) -> str:
       }}
       button:hover {{
         transform: translateY(-1px);
-        box-shadow: 0 8px 18px rgba(15, 76, 129, 0.24);
+        box-shadow: 0 8px 20px rgba(3, 88, 216, 0.3);
         background: var(--accent-strong);
       }}
       button.secondary {{
@@ -248,10 +301,10 @@ def page(title: str, body: str) -> str:
         gap: 12px;
       }}
       .item {{
-        border: 1px solid var(--line);
+        border: 1px solid rgba(3, 88, 216, 0.12);
         border-radius: 12px;
         padding: 13px;
-        background: rgba(255, 255, 255, 0.78);
+        background: rgba(255, 255, 255, 0.85);
       }}
       .item h4 {{
         margin: 0 0 6px;
@@ -294,9 +347,9 @@ def page(title: str, body: str) -> str:
       .pill {{
         padding: 6px 10px 7px;
         border-radius: 999px;
-        border: 1px solid var(--line);
-        background: rgba(255, 255, 255, 0.76);
-        color: #475569;
+        border: 1px solid rgba(3, 88, 216, 0.13);
+        background: rgba(255, 255, 255, 0.9);
+        color: #4c5f7f;
         font-size: 0.77rem;
         font-weight: 600;
       }}
@@ -347,6 +400,24 @@ def page(title: str, body: str) -> str:
         flex-wrap: wrap;
         gap: 10px;
       }}
+      @keyframes rise-in {{
+        from {{
+          opacity: 0;
+          transform: translateY(9px);
+        }}
+        to {{
+          opacity: 1;
+          transform: translateY(0);
+        }}
+      }}
+      @keyframes glow-in {{
+        from {{
+          box-shadow: 0 0 0 rgba(3, 88, 216, 0);
+        }}
+        to {{
+          box-shadow: 0 10px 34px rgba(3, 88, 216, 0.11);
+        }}
+      }}
       @media (max-width: 920px) {{
         .layout, .grid, .wide-grid {{ grid-template-columns: 1fr; }}
         .masthead {{
@@ -360,6 +431,7 @@ def page(title: str, body: str) -> str:
     </style>
   </head>
   <body>
+    <div class="global-ribbon">UI Redesign Active</div>
     <main class="shell">
       {body}
     </main>
@@ -373,6 +445,53 @@ def page_with_auto_refresh(title: str, body: str, interval_seconds: int) -> str:
         title,
         f'<script>setTimeout(function(){{window.location.reload();}}, {refresh * 1000});</script>{body}',
     )
+
+
+def react_app_shell(title: str = "AI Dev Platform") -> str:
+    def asset_url(path: str) -> str:
+        normalized = path.removeprefix("assets/")
+        return f"/ui/assets/{escape(normalized)}"
+
+    manifest_path = Path(__file__).resolve().parent / "static" / ".vite" / "manifest.json"
+    app_script = ""
+    app_styles = ""
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            entry = manifest.get("index.html", {})
+            script = entry.get("file")
+            if script:
+                app_script = f'<script type="module" src="{asset_url(script)}"></script>'
+            app_styles = "".join(
+                f'<link rel="stylesheet" href="{asset_url(item)}">'
+                for item in entry.get("css", [])
+            )
+        except (OSError, json.JSONDecodeError):
+            app_script = ""
+
+    fallback = """
+      <div class="shell">
+        <section class="panel hero">
+          <div class="eyebrow">Frontend build missing</div>
+          <h2>React console assets have not been built yet.</h2>
+          <p>Run <code>npm --prefix frontend run build</code> and restart the FastAPI server.</p>
+        </section>
+      </div>
+    """
+
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{escape(title)}</title>
+    {app_styles}
+  </head>
+  <body>
+    <div id="root">{fallback if not app_script else ""}</div>
+    {app_script}
+  </body>
+</html>"""
 
 
 def status_badge(value: str) -> str:
@@ -399,6 +518,7 @@ def layout(
       <div>
         <h1 class="title">{escape(title)}</h1>
         <p class="subtitle">{escape(subtitle)}</p>
+        <div class="build-tag">UI Redesign Live · 2026-04-29</div>
       </div>
       <div class="nav">{nav_html}</div>
     </header>

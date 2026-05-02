@@ -12,10 +12,19 @@ class FileChange(BaseModel):
     change_type: Literal["upsert", "delete"] = "upsert"
 
 
+class LineChange(BaseModel):
+    path: str
+    operation: Literal["replace", "insert_after", "insert_before", "delete"]
+    anchor: str
+    content: str = ""
+    occurrence: int = Field(default=1, ge=1)
+
+
 class CodeChangeResponse(BaseModel):
     changed_files: list[str]
     implementation_notes: list[str]
     requires_operator_approval: bool = True
+    line_changes: list[LineChange] = Field(default_factory=list)
     file_changes: list[FileChange] = Field(default_factory=list)
 
     @field_validator("changed_files", "implementation_notes", mode="before")

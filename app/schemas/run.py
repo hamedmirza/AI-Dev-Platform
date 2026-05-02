@@ -16,6 +16,8 @@ class TaskSummaryResponse(BaseModel):
     provider_override: Optional[str]
     model_override: Optional[str]
     request_text: str
+    created_at: datetime
+    created_at_human: str
 
 
 class RunStateSnapshotResponse(BaseModel):
@@ -38,6 +40,8 @@ class RunResponse(BaseModel):
     error_message: Optional[str]
     created_at: datetime
     updated_at: datetime
+    created_at_human: str
+    updated_at_human: str
     task: TaskSummaryResponse
     latest_state: Optional[RunStateSnapshotResponse] = None
 

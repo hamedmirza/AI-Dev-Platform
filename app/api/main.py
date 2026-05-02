@@ -1,9 +1,11 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
 
 from app.api.routes.backups import router as backups_router
 from app.api.routes.config import router as config_router
@@ -59,6 +61,9 @@ def create_app() -> FastAPI:
     app.include_router(tasks_router, prefix="/api")
     app.include_router(runs_router, prefix="/api")
     app.include_router(ui_router)
+    ui_assets = Path(__file__).resolve().parents[1] / "ui" / "static" / "assets"
+    if ui_assets.exists():
+        app.mount("/ui/assets", StaticFiles(directory=ui_assets), name="ui-assets")
     return app
 
 

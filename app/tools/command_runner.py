@@ -7,10 +7,10 @@ from app.core.exceptions import ConfigurationError
 from app.tools.base import CommandResult
 
 ALLOWED_VALIDATION_COMMANDS = {
-    ("pytest",),
-    ("ruff", "check"),
-    ("ruff", "format", "--check"),
-    ("mypy",),
+    ("ruff", "check", "."),
+    ("mypy", "app"),
+    ("pytest", "-q"),
+    ("pytest", "tests", "-q"),
 }
 
 
@@ -57,7 +57,14 @@ def run_validation_command(
 
 
 def _is_allowed_command(command: list[str]) -> bool:
-    return any(command[: len(prefix)] == list(prefix) for prefix in ALLOWED_VALIDATION_COMMANDS)
+    if tuple(command) in ALLOWED_VALIDATION_COMMANDS:
+        return True
+    return (
+        len(command) == 3
+        and command[0] == "pytest"
+        and command[2] == "-q"
+        and not command[1].startswith("-")
+    )
 
 
 def _normalize_output(value: bytes | str | None) -> str:

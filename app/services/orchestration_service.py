@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import queue
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Optional, cast
 
 from pydantic import BaseModel
+from sqlalchemy import select
 
 from app.core.enums import ArtifactType, ProviderStatus, RunStage, RunStatus, StringEnum
 from app.core.exceptions import ConfigurationError, ProviderError
@@ -25,10 +27,11 @@ from app.db.session import get_session_factory
 from app.graph.state import WorkflowState
 from app.providers.registry import get_provider, resolve_provider
 from app.schemas.architecture import ArchitectureResponse
-from app.schemas.code_change import CodeChangeResponse, FileChange
+from app.schemas.code_change import CodeChangeResponse, FileChange, LineChange
 from app.schemas.plan import PlanResponse
 from app.schemas.review import ReviewResponse
 from app.schemas.test_result import TestResultResponse
+from app.schemas.ui_design import UIDesignResponse
 from app.services.repository_service import (
     create_run_workspace,
     delete_run_workspace_file,
@@ -60,6 +63,10 @@ class StageTimeoutError(TimeoutError):
     pass
 
 
+class PatchGuardError(ValueError):
+    pass
+
+
 STAGES: list[StageDefinition] = [
     StageDefinition(
         stage=RunStage.PLANNER,
@@ -84,6 +91,18 @@ STAGES: list[StageDefinition] = [
         ),
     ),
     StageDefinition(
+        stage=RunStage.UI_DESIGNER,
+        artifact_type=ArtifactType.UI_DESIGN,
+        artifact_title="UI design direction",
+        schema=UIDesignResponse,
+        system_prompt_path="app/agents/prompts/ui_designer.md",
+        user_prompt_template=(
+            "Return JSON with design_summary, visual_system, layout_plan, interaction_notes, "
+            "accessibility_notes, and implementation_notes for this task. Make the UI modern, "
+            "polished, and cool while preserving operational usability:\n\n{request_text}"
+        ),
+    ),
+    StageDefinition(
         stage=RunStage.CODER,
         artifact_type=ArtifactType.CODE_CHANGE,
         artifact_title="Proposed code change",
@@ -91,8 +110,13 @@ STAGES: list[StageDefinition] = [
         system_prompt_path="app/agents/prompts/coder.md",
         user_prompt_template=(
             "Return JSON with changed_files, implementation_notes, requires_operator_approval, "
-            "and file_changes for this task. file_changes must contain actual workspace edits "
-            "as objects with path, content, and change_type upsert/delete:\n\n{request_text}"
+            "line_changes, and file_changes for this task. Prefer line_changes for small "
+            "line-level edits. line_changes objects must contain path, operation, anchor, "
+            "content, and optional occurrence. Use file_changes only for whole-file upsert/delete "
+            "edits that are truly necessary. Preserve existing "
+            "FastAPI APIRouter route paths, function names, imports, auth/session behavior, "
+            "redirects, and UI flows unless explicitly requested otherwise. Do not replace "
+            "app/ui/routes.py with a standalone FastAPI app:\n\n{request_text}"
         ),
     ),
     StageDefinition(
@@ -114,7 +138,10 @@ STAGES: list[StageDefinition] = [
         system_prompt_path="app/agents/prompts/tester.md",
         user_prompt_template=(
             "Return JSON with passed, summary, commands, and failures describing the "
-            "validation strategy for this task:\n\n{request_text}"
+            "validation strategy for this task. commands must contain only whitelist-safe "
+            "commands: ruff check ., mypy app, pytest -q, pytest tests -q, or pytest "
+            "<test-path> -q. Do not emit shell builtins, pipes, redirects, grep, find, "
+            "test, python -c, bash, sh, awk, sed, curl, or compound commands:\n\n{request_text}"
         ),
     ),
 ]
@@ -127,15 +154,16 @@ class OrchestrationService:
         self._worker_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
+        if self._worker_thread and self._worker_thread.is_alive():
+            return
+
         settings = get_settings()
         settings.workspace_root_path.mkdir(parents=True, exist_ok=True)
         settings.backup_root_path.mkdir(parents=True, exist_ok=True)
+        recovered_pending_runs = self._recover_interrupted_runs()
         provider_health = get_provider().health_check()
         if provider_health.status == ProviderStatus.UNAVAILABLE:
             raise ProviderError(provider_health.detail)
-
-        if self._worker_thread and self._worker_thread.is_alive():
-            return
 
         self._stop_event.clear()
         self._worker_thread = threading.Thread(
@@ -144,6 +172,8 @@ class OrchestrationService:
             daemon=True,
         )
         self._worker_thread.start()
+        for run_id in recovered_pending_runs:
+            self.enqueue_run(run_id)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -152,6 +182,44 @@ class OrchestrationService:
 
     def enqueue_run(self, run_id: str) -> None:
         self._queue.put(run_id)
+
+    def _recover_interrupted_runs(self) -> list[str]:
+        session = get_session_factory()()
+        try:
+            interrupted_runs = session.scalars(
+                select(RunModel).where(RunModel.status.in_([RunStatus.RUNNING, "queued"]))
+            ).all()
+            pending_runs = session.scalars(
+                select(RunModel).where(RunModel.status == RunStatus.PENDING)
+            ).all()
+
+            for run in interrupted_runs:
+                previous_status = str(run.status)
+                run.status = RunStatus.FAILED
+                run.error_message = (
+                    "Run was recovered from an interrupted or legacy worker state. Retry it from "
+                    "the UI/API to create a fresh workspace."
+                )
+                self._add_event(
+                    session,
+                    run.id,
+                    "run_recovered_stale",
+                    run.error_message,
+                )
+                self._record_state_snapshot(
+                    session,
+                    run,
+                    self._build_state_for_stage(run, run.current_stage),
+                    current_step="startup_recovery_failed",
+                    payload={"previous_status": previous_status},
+                )
+
+            if interrupted_runs:
+                session.commit()
+
+            return [run.id for run in pending_runs]
+        finally:
+            session.close()
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -206,6 +274,7 @@ class OrchestrationService:
 
             planner_stage = self._stage_by_name(RunStage.PLANNER)
             architect_stage = self._stage_by_name(RunStage.ARCHITECT)
+            ui_designer_stage = self._stage_by_name(RunStage.UI_DESIGNER)
             coder_stage = self._stage_by_name(RunStage.CODER)
             reviewer_stage = self._stage_by_name(RunStage.REVIEWER)
             tester_stage = self._stage_by_name(RunStage.TESTER)
@@ -226,6 +295,11 @@ class OrchestrationService:
                 self._run_stage(session, run, provider, architect_stage, task.request_text),
             )
             workflow_state["architecture_output"] = architect_model.model_dump_json()
+            ui_design_model = cast(
+                UIDesignResponse,
+                self._run_stage(session, run, provider, ui_designer_stage, task.request_text),
+            )
+            workflow_state["ui_design_output"] = ui_design_model.model_dump_json()
 
             review_retries = 0
             test_retries = 0
@@ -235,16 +309,98 @@ class OrchestrationService:
             while True:
                 coder_prompt = self._build_coder_request(
                     task.request_text,
+                    run.id,
+                    task.target_files,
                     planner_model,
                     architect_model,
+                    ui_design_model,
                     retry_feedback,
                 )
-                code_model = cast(
-                    CodeChangeResponse,
-                    self._run_stage(session, run, provider, coder_stage, coder_prompt),
-                )
+                try:
+                    code_model = cast(
+                        CodeChangeResponse,
+                        self._run_stage(session, run, provider, coder_stage, coder_prompt),
+                    )
+                except ProviderError as exc:
+                    test_retries += 1
+                    total_retries += 1
+                    retry_feedback = [
+                        f"Coder stage failed before producing a usable patch: {exc}",
+                        "Return valid JSON only, matching the code_change schema.",
+                    ]
+                    run.retry_count = total_retries
+                    workflow_state["retry_count"] = total_retries
+                    workflow_state["errors"] = retry_feedback
+                    self._add_event(
+                        session,
+                        run.id,
+                        "coder_stage_failed",
+                        "Coder stage failed before producing a usable patch; retrying coder stage.",
+                        json.dumps({"failures": retry_feedback}, indent=2),
+                    )
+                    if self._should_block(run, review_retries, test_retries, total_retries):
+                        if self._maybe_short_circuit_ui_noop(
+                            session,
+                            run,
+                            task,
+                            workflow_state,
+                            "Coder stage retry threshold exceeded, but existing workspace already "
+                            "satisfies UI contracts and validation.",
+                        ):
+                            return
+                        self._block_run(
+                            session,
+                            run,
+                            "Coder stage retry threshold exceeded.",
+                            json.dumps({"failures": retry_feedback}, indent=2),
+                        )
+                        return
+
+                    run.status = RunStatus.REVIEW_REQUIRED
+                    run.error_message = "Coder stage failed before producing a usable patch."
+                    session.commit()
+                    run.status = RunStatus.RUNNING
+                    continue
                 workflow_state["code_output"] = code_model.model_dump_json()
-                self._apply_code_changes(session, run, code_model)
+                try:
+                    self._apply_code_changes(session, run, code_model)
+                except PatchGuardError as exc:
+                    test_retries += 1
+                    total_retries += 1
+                    retry_feedback = [str(exc)]
+                    run.retry_count = total_retries
+                    workflow_state["retry_count"] = total_retries
+                    workflow_state["errors"] = retry_feedback
+                    self._add_event(
+                        session,
+                        run.id,
+                        "patch_guard_failed",
+                        "AI-generated patch violated deterministic safety guards.",
+                        json.dumps({"failures": retry_feedback}, indent=2),
+                    )
+                    if self._should_block(run, review_retries, test_retries, total_retries):
+                        if self._maybe_short_circuit_ui_noop(
+                            session,
+                            run,
+                            task,
+                            workflow_state,
+                            "Patch guard retry threshold exceeded, but existing workspace already "
+                            "satisfies UI contracts and validation.",
+                        ):
+                            return
+                        self._block_run(
+                            session,
+                            run,
+                            "Patch guard retry threshold exceeded.",
+                            json.dumps({"failures": retry_feedback}, indent=2),
+                        )
+                        return
+
+                    run.status = RunStatus.REVIEW_REQUIRED
+                    run.error_message = "AI-generated patch violated deterministic safety guards."
+                    session.commit()
+                    run.status = RunStatus.RUNNING
+                    continue
 
                 review_prompt = self._build_review_request(task.request_text, retry_feedback)
                 review_model = cast(
@@ -267,6 +423,15 @@ class OrchestrationService:
                         review_model.model_dump_json(),
                     )
                     if self._should_block(run, review_retries, test_retries, total_retries):
+                        if self._maybe_short_circuit_ui_noop(
+                            session,
+                            run,
+                            task,
+                            workflow_state,
+                            "Reviewer retry threshold exceeded, but existing workspace already "
+                            "satisfies UI contracts and validation.",
+                        ):
+                            return
                         self._block_run(
                             session,
                             run,
@@ -307,6 +472,15 @@ class OrchestrationService:
                         test_model.model_dump_json(),
                     )
                     if self._should_block(run, review_retries, test_retries, total_retries):
+                        if self._maybe_short_circuit_ui_noop(
+                            session,
+                            run,
+                            task,
+                            workflow_state,
+                            "Validation retry threshold exceeded, but existing workspace already "
+                            "satisfies UI contracts and validation.",
+                        ):
+                            return
                         self._block_run(
                             session,
                             run,
@@ -415,17 +589,27 @@ class OrchestrationService:
         run: RunModel,
         code_model: CodeChangeResponse,
     ) -> None:
-        if not code_model.file_changes:
+        if not code_model.line_changes and not code_model.file_changes:
             self._add_event(
                 session,
                 run.id,
                 "code_patch_skipped",
-                "Coder response did not include file_changes; no workspace files were modified.",
+                "Coder response did not include line_changes or file_changes; no workspace "
+                "files were modified.",
             )
             session.commit()
             return
 
+        code_model = self._drop_invalid_route_change(session, run, code_model)
+        self._validate_patch_scope(run, code_model)
+        self._validate_patch_intent(run, code_model)
+        self._validate_line_change_targets(code_model)
+        self._validate_route_contract(run.id, code_model)
+        self._validate_render_contract(run.id, code_model)
+
         applied = []
+        for line_change in code_model.line_changes:
+            applied.append(self._apply_line_change(run.id, line_change))
         for file_change in code_model.file_changes:
             applied.append(self._apply_file_change(run.id, file_change))
 
@@ -434,7 +618,7 @@ class OrchestrationService:
             session,
             run.id,
             "code_patch_applied",
-            f"Applied {len(applied)} AI-generated file change(s) to the run workspace.",
+            f"Applied {len(applied)} AI-generated change(s) to the run workspace.",
             json.dumps({"applied": applied, "changed_files": diff["changed_files"]}, indent=2),
         )
         session.add(
@@ -448,6 +632,296 @@ class OrchestrationService:
             )
         )
         session.commit()
+
+    def _drop_invalid_route_change(
+        self,
+        session,
+        run: RunModel,
+        code_model: CodeChangeResponse,
+    ) -> CodeChangeResponse:
+        route_change = self._route_file_change(code_model)
+        if route_change is None:
+            return code_model
+
+        try:
+            self._validate_route_file_change(run.id, route_change)
+            return code_model
+        except PatchGuardError:
+            non_route_changes = [
+                item
+                for item in code_model.file_changes
+                if item.path.strip().lstrip("/") != "app/ui/routes.py"
+            ]
+            if not non_route_changes:
+                raise
+
+            self._add_event(
+                session,
+                run.id,
+                "route_patch_dropped",
+                "Dropped unsafe app/ui/routes.py edit and kept remaining file changes.",
+            )
+            return code_model.model_copy(
+                update={
+                    "file_changes": non_route_changes,
+                    "changed_files": [
+                        item
+                        for item in code_model.changed_files
+                        if item.strip().lstrip("/") != "app/ui/routes.py"
+                    ],
+                }
+            )
+
+    def _validate_patch_scope(self, run: RunModel, code_model: CodeChangeResponse) -> None:
+        target_files = set(run.task.target_files if run.task is not None else [])
+        if not target_files:
+            return
+
+        changed_paths = [
+            *(item.path for item in code_model.line_changes),
+            *(item.path for item in code_model.file_changes),
+        ]
+        blocked_paths = [
+            path for path in changed_paths if not self._path_allowed_by_targets(path, target_files)
+        ]
+        if blocked_paths:
+            allowed = ", ".join(sorted(target_files))
+            blocked = ", ".join(sorted(blocked_paths))
+            raise PatchGuardError(
+                f"Patch touched files outside task target_files. Allowed: {allowed}. "
+                f"Blocked: {blocked}."
+            )
+
+    def _path_allowed_by_targets(self, path: str, target_files: set[str]) -> bool:
+        normalized_path = path.strip().lstrip("/")
+        for target in target_files:
+            normalized_target = target.strip().lstrip("/")
+            if normalized_path == normalized_target:
+                return True
+            if normalized_target.endswith("/") and normalized_path.startswith(normalized_target):
+                return True
+        return False
+
+    def _validate_patch_intent(self, run: RunModel, code_model: CodeChangeResponse) -> None:
+        task = run.task
+        if task is None:
+            return
+
+        request_text = f"{task.title}\n{task.request_text}\n{' '.join(task.constraints)}".lower()
+        is_doc_task = (task.task_type or "").lower() in {"doc", "docs", "documentation"}
+        asks_for_tiny_change = any(
+            phrase in request_text
+            for phrase in (
+                "one short sentence",
+                "one sentence",
+                "tiny",
+                "small controlled",
+                "documentation-only",
+                "wording",
+            )
+        )
+        if not (is_doc_task or asks_for_tiny_change):
+            return
+
+        for file_change in code_model.file_changes:
+            normalized_path = file_change.path.strip().lstrip("/")
+            if not normalized_path.lower().endswith((".md", ".txt", ".rst")):
+                continue
+            if file_change.change_type != "upsert":
+                continue
+
+            existing_path = get_run_workspace_path(run.id) / normalized_path
+            if not existing_path.exists():
+                continue
+
+            original_lines = existing_path.read_text(encoding="utf-8").splitlines()
+            proposed_lines = file_change.content.splitlines()
+            if not original_lines:
+                continue
+
+            deleted, inserted = self._line_delta_counts(original_lines, proposed_lines)
+            changed = deleted + inserted
+            deletion_ratio = deleted / max(len(original_lines), 1)
+            changed_ratio = changed / max(len(original_lines), 1)
+            allowed_insertions = 6 if asks_for_tiny_change else max(12, len(original_lines) // 4)
+            allowed_deletions = 0 if asks_for_tiny_change else max(4, len(original_lines) // 10)
+
+            if (
+                inserted > allowed_insertions
+                or deleted > allowed_deletions
+                or deletion_ratio > 0.15
+                or changed_ratio > 0.35
+            ):
+                raise PatchGuardError(
+                    "Patch is too large for the requested documentation intent. "
+                    f"{normalized_path}: inserted={inserted}, deleted={deleted}, "
+                    f"original_lines={len(original_lines)}. Keep the change narrowly scoped."
+                )
+
+        for line_change in code_model.line_changes:
+            normalized_path = line_change.path.strip().lstrip("/")
+            if not normalized_path.lower().endswith((".md", ".txt", ".rst")):
+                continue
+            inserted = len(line_change.content.splitlines()) if line_change.content else 0
+            if inserted > 6:
+                raise PatchGuardError(
+                    "Line-level patch is too large for the requested documentation intent. "
+                    f"{normalized_path}: inserted={inserted}. Keep the change narrowly scoped."
+                )
+            if line_change.operation == "delete" and not any(
+                phrase in request_text for phrase in ("delete", "remove")
+            ):
+                raise PatchGuardError(
+                    "Line-level patch attempted to delete documentation content without an "
+                    "explicit delete/remove request."
+                )
+
+    def _line_delta_counts(
+        self,
+        original_lines: list[str],
+        proposed_lines: list[str],
+    ) -> tuple[int, int]:
+        prefix = 0
+        max_prefix = min(len(original_lines), len(proposed_lines))
+        while prefix < max_prefix and original_lines[prefix] == proposed_lines[prefix]:
+            prefix += 1
+
+        original_suffix = len(original_lines)
+        proposed_suffix = len(proposed_lines)
+        while (
+            original_suffix > prefix
+            and proposed_suffix > prefix
+            and original_lines[original_suffix - 1] == proposed_lines[proposed_suffix - 1]
+        ):
+            original_suffix -= 1
+            proposed_suffix -= 1
+
+        return original_suffix - prefix, proposed_suffix - prefix
+
+    def _validate_route_contract(self, run_id: str, code_model: CodeChangeResponse) -> None:
+        route_change = self._route_file_change(code_model)
+        if route_change is None:
+            return
+        self._validate_route_file_change(run_id, route_change)
+
+    def _route_file_change(self, code_model: CodeChangeResponse) -> Optional[FileChange]:
+        return next(
+            (
+                item
+                for item in code_model.file_changes
+                if item.path.strip().lstrip("/") == "app/ui/routes.py"
+            ),
+            None,
+        )
+
+    def _validate_line_change_targets(self, code_model: CodeChangeResponse) -> None:
+        protected_files = {"app/ui/routes.py", "app/ui/render.py"}
+        blocked = sorted(
+            {
+                item.path.strip().lstrip("/")
+                for item in code_model.line_changes
+                if item.path.strip().lstrip("/") in protected_files
+            }
+        )
+        if blocked:
+            raise PatchGuardError(
+                "Line-level patches are not allowed for protected UI route/render files. "
+                f"Use scoped file_changes preserving contracts instead: {', '.join(blocked)}."
+            )
+
+    def _validate_route_file_change(self, run_id: str, route_change: FileChange) -> None:
+        if route_change.change_type == "delete":
+            raise PatchGuardError("Patch attempted to delete app/ui/routes.py.")
+
+        route_path = get_run_workspace_path(run_id) / "app/ui/routes.py"
+        if not route_path.exists():
+            return
+
+        baseline = self._route_signatures(route_path.read_text(encoding="utf-8"))
+        proposed = self._route_signatures(route_change.content)
+        if proposed != baseline:
+            raise PatchGuardError(
+                "Patch changed app/ui/routes.py route signatures. Preserve existing route "
+                "decorators, paths, function names, and parameters."
+            )
+
+    def _validate_render_contract(self, run_id: str, code_model: CodeChangeResponse) -> None:
+        render_change = next(
+            (
+                item
+                for item in code_model.file_changes
+                if item.path.strip().lstrip("/") == "app/ui/render.py"
+            ),
+            None,
+        )
+        if render_change is None:
+            return
+        if render_change.change_type == "delete":
+            raise PatchGuardError("Patch attempted to delete app/ui/render.py.")
+
+        render_path = get_run_workspace_path(run_id) / "app/ui/render.py"
+        if not render_path.exists():
+            return
+
+        required_names = {"layout", "page", "page_with_auto_refresh", "status_badge"}
+        baseline = self._function_signatures(
+            render_path.read_text(encoding="utf-8"), required_names
+        )
+        proposed = self._function_signatures(render_change.content, required_names)
+        if proposed != baseline:
+            missing = sorted(set(baseline) - set(proposed))
+            details = f" Missing: {', '.join(missing)}." if missing else ""
+            raise PatchGuardError(
+                "Patch changed app/ui/render.py public helper contract. Preserve existing "
+                "function names and parameters for layout, page, page_with_auto_refresh, "
+                f"and status_badge.{details}"
+            )
+
+    def _function_signatures(self, source: str, names: set[str]) -> dict[str, str]:
+        try:
+            module = ast.parse(source)
+        except SyntaxError as exc:
+            raise PatchGuardError(f"Python file is not valid Python: {exc.msg}.") from exc
+        signatures: dict[str, str] = {}
+        for node in module.body:
+            if isinstance(node, ast.FunctionDef) and node.name in names:
+                signatures[node.name] = ast.unparse(node.args)
+        return signatures
+
+    def _route_signatures(self, source: str) -> list[tuple[str, str, str, str]]:
+        try:
+            module = ast.parse(source)
+        except SyntaxError as exc:
+            raise PatchGuardError(f"app/ui/routes.py is not valid Python: {exc.msg}.") from exc
+
+        signatures: list[tuple[str, str, str, str]] = []
+        for node in module.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for decorator in node.decorator_list:
+                route = self._route_decorator(decorator)
+                if route is None:
+                    continue
+                method, path = route
+                signatures.append((method, path, node.name, ast.unparse(node.args)))
+        return signatures
+
+    def _route_decorator(self, decorator: ast.expr) -> Optional[tuple[str, str]]:
+        if not isinstance(decorator, ast.Call):
+            return None
+        func = decorator.func
+        if not isinstance(func, ast.Attribute):
+            return None
+        if func.attr not in {"get", "post", "put", "patch", "delete"}:
+            return None
+        if not isinstance(func.value, ast.Name) or func.value.id != "router":
+            return None
+        if not decorator.args:
+            return None
+        path_arg = decorator.args[0]
+        if not isinstance(path_arg, ast.Constant) or not isinstance(path_arg.value, str):
+            return None
+        return func.attr, path_arg.value
 
     def _apply_file_change(self, run_id: str, file_change: FileChange) -> dict[str, object]:
         if file_change.change_type == "delete":
@@ -463,6 +937,53 @@ class OrchestrationService:
             "path": file_change.path,
             "change_type": file_change.change_type,
             "bytes": len(file_change.content.encode("utf-8")),
+        }
+
+    def _apply_line_change(self, run_id: str, line_change: LineChange) -> dict[str, object]:
+        normalized_path = line_change.path.strip().lstrip("/")
+        file_path = get_run_workspace_path(run_id) / normalized_path
+        if not file_path.exists():
+            raise PatchGuardError(f"Line-level patch target does not exist: {normalized_path}.")
+        if not file_path.is_file():
+            raise PatchGuardError(f"Line-level patch target is not a file: {normalized_path}.")
+
+        original_text = file_path.read_text(encoding="utf-8")
+        had_trailing_newline = original_text.endswith("\n")
+        lines = original_text.splitlines()
+        matches = [index for index, line in enumerate(lines) if line == line_change.anchor]
+        if line_change.occurrence > len(matches):
+            raise PatchGuardError(
+                "Line-level patch anchor was not found with the requested occurrence. "
+                f"{normalized_path}: occurrence={line_change.occurrence}."
+            )
+
+        line_index = matches[line_change.occurrence - 1]
+        content_lines = line_change.content.splitlines()
+        if line_change.operation == "replace":
+            lines[line_index : line_index + 1] = content_lines
+        elif line_change.operation == "insert_after":
+            lines[line_index + 1 : line_index + 1] = content_lines
+        elif line_change.operation == "insert_before":
+            lines[line_index:line_index] = content_lines
+        elif line_change.operation == "delete":
+            if line_change.content:
+                raise PatchGuardError("Line-level delete patches must not include content.")
+            del lines[line_index]
+        else:  # pragma: no cover - pydantic validates allowed operations.
+            raise PatchGuardError(
+                f"Unsupported line-level patch operation: {line_change.operation}."
+            )
+
+        new_text = "\n".join(lines)
+        if had_trailing_newline or new_text:
+            new_text += "\n"
+        write_run_workspace_file(run_id, normalized_path, new_text)
+        return {
+            "path": normalized_path,
+            "change_type": "line",
+            "operation": line_change.operation,
+            "line_number": line_index + 1,
+            "bytes": len(line_change.content.encode("utf-8")),
         }
 
     def _run_local_validation(
@@ -590,6 +1111,109 @@ class OrchestrationService:
         )
         session.commit()
 
+    def _maybe_short_circuit_ui_noop(
+        self,
+        session,
+        run: RunModel,
+        task: TaskModel,
+        workflow_state: WorkflowState,
+        reason: str,
+    ) -> bool:
+        if not self._is_ui_task(task):
+            return False
+
+        diff = get_run_workspace_diff(run.id)
+        if bool(diff.get("has_changes")):
+            return False
+
+        commands = [["ruff", "check", "."], ["mypy", "app"], ["pytest", "-q"]]
+        command_results: list[dict[str, object]] = []
+        for command in commands:
+            result = run_validation_command(command, cwd=get_run_workspace_path(run.id))
+            command_results.append(self._command_result_payload(result))
+            if result.returncode != 0:
+                return False
+
+        code_model = CodeChangeResponse(
+            changed_files=[],
+            implementation_notes=[
+                "No workspace code changes required. Existing UI implementation already satisfies "
+                "route/render contracts and validation."
+            ],
+            requires_operator_approval=False,
+            file_changes=[],
+        )
+        review_model = ReviewResponse(
+            approved=True,
+            summary="No additional code changes required for this UI task.",
+            issues=[],
+        )
+        test_model = TestResultResponse(
+            passed=True,
+            summary="No-op completion confirmed by local validation commands.",
+            commands=["ruff check .", "mypy app", "pytest -q"],
+            failures=[],
+        )
+
+        session.add(
+            self._make_artifact(
+                run.id,
+                ArtifactType.CODE_CHANGE,
+                "Proposed code change",
+                code_model,
+            )
+        )
+        session.add(self._make_artifact(run.id, ArtifactType.REVIEW, "Review result", review_model))
+        session.add(
+            self._make_artifact(
+                run.id,
+                ArtifactType.TEST_RESULT,
+                "Validation result",
+                test_model,
+            )
+        )
+        session.add(
+            self._make_log_artifact(
+                run.id,
+                "Local validation commands",
+                {"passed": True, "results": command_results},
+            )
+        )
+        self._add_event(
+            session,
+            run.id,
+            "noop_ui_completion",
+            reason,
+            json.dumps({"validation": command_results}, indent=2),
+        )
+
+        run.status = RunStatus.AWAITING_APPROVAL
+        run.current_stage = RunStage.APPROVAL
+        run.error_message = None
+        workflow_state["status"] = RunStatus.AWAITING_APPROVAL
+        workflow_state["stage"] = RunStage.APPROVAL
+        self._add_event(
+            session,
+            run.id,
+            "awaiting_approval",
+            "Run is awaiting operator approval before any git-side effects.",
+        )
+        self._record_state_snapshot(
+            session,
+            run,
+            workflow_state,
+            current_step="awaiting_operator_approval",
+            payload={"reason": reason, "no_op": True},
+        )
+        session.commit()
+        return True
+
+    def _is_ui_task(self, task: TaskModel) -> bool:
+        target_files = set(task.target_files)
+        return bool(target_files) and target_files.issubset(
+            {"app/ui/render.py", "app/ui/routes.py"}
+        )
+
     def _add_event(
         self,
         session,
@@ -610,20 +1234,136 @@ class OrchestrationService:
     def _build_coder_request(
         self,
         request_text: str,
+        run_id: str,
+        target_files: list[str],
         planner_model: PlanResponse,
         architect_model: ArchitectureResponse,
+        ui_design_model: UIDesignResponse,
         retry_feedback: list[str],
     ) -> str:
         sections = [
             request_text,
-            "\nPlanner summary:",
-            planner_model.model_dump_json(indent=2),
-            "\nArchitecture plan:",
-            architect_model.model_dump_json(indent=2),
+            "\nCoder hard constraints:",
+            "- Preserve existing FastAPI APIRouter setup, route paths, route function names, "
+            "imports, form parameters, redirects, auth/session checks, and API/service calls.",
+            "- Do not create a standalone FastAPI() app in app/ui/routes.py.",
+            "- Do not remove existing UI flows: login, dashboard, repository, provider, "
+            "settings, backups, run detail, run actions, workspace diff, workspace editor, "
+            "and backup restore rehearsal.",
+            "- Keep changes scoped to existing UI rendering and styling unless a route-level "
+            "change is strictly necessary.",
+            "- If app/ui/render.py is in target_files, implement the visual redesign there first "
+            "and do not edit app/ui/routes.py unless the requested behavior cannot work without "
+            "it.",
+            "- Return valid JSON only. Do not include Markdown fences, prose outside JSON, or "
+            "comments.",
         ]
+        if target_files:
+            sections.extend(
+                [
+                    "\nTask target_files allowlist:",
+                    *[f"- {item}" for item in target_files],
+                    "Do not include line_changes or file_changes outside this allowlist.",
+                ]
+            )
+        target_file_context = self._target_file_anchor_context(run_id, target_files)
+        if target_file_context:
+            sections.extend(
+                [
+                    "\nTarget file anchor context:",
+                    target_file_context,
+                    "For line_changes, choose anchor values from the exact file lines above. "
+                    "Do not include the numeric prefix in the anchor string.",
+                ]
+            )
+        route_contract = self._route_contract_prompt(run_id)
+        if route_contract:
+            sections.extend(["\nExisting app/ui/routes.py route contract:", route_contract])
+        render_contract = self._render_contract_prompt(run_id)
+        if render_contract:
+            sections.extend(
+                ["\nExisting app/ui/render.py public helper contract:", render_contract]
+            )
         if retry_feedback:
             sections.extend(["\nRetry feedback:", *[f"- {item}" for item in retry_feedback]])
+        sections.extend(
+            [
+                "\nImplementation guidance:",
+                "- For visual redesign tasks, prefer app/ui/render.py edits and existing CSS/HTML "
+                "helpers.",
+                "- Avoid editing app/ui/routes.py unless the exact route contract above is "
+                "preserved.",
+                "- If a guard rejected a previous route edit, remove the route edit and make the "
+                "visual change in app/ui/render.py instead.",
+                "- Before returning JSON, mentally check Python string quoting for embedded HTML.",
+                "\nPlanner summary:",
+                planner_model.summary,
+                "\nPlanner acceptance criteria:",
+                *self._bullet_lines(planner_model.acceptance_criteria),
+                "\nArchitecture plan:",
+                *self._bullet_lines(architect_model.file_change_plan),
+                "\nUI design direction:",
+                ui_design_model.design_summary,
+                "\nUI implementation notes:",
+                *self._bullet_lines(ui_design_model.implementation_notes),
+            ]
+        )
         return "\n".join(sections)
+
+    def _bullet_lines(self, values: list[str]) -> list[str]:
+        return [f"- {value}" for value in values[:8]]
+
+    def _target_file_anchor_context(self, run_id: str, target_files: list[str]) -> str:
+        if not target_files:
+            return ""
+
+        workspace_path = get_run_workspace_path(run_id)
+        context_blocks: list[str] = []
+        for raw_path in target_files[:5]:
+            normalized_path = raw_path.strip().lstrip("/")
+            if normalized_path.endswith("/"):
+                continue
+            file_path = workspace_path / normalized_path
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            try:
+                file_text = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            lines = file_text.splitlines()
+            if len(lines) > 80:
+                preview_lines = [*lines[:40], "...", *lines[-20:]]
+            else:
+                preview_lines = lines
+            numbered_lines = [
+                f"{index + 1}: {line}" for index, line in enumerate(preview_lines)
+            ]
+            context_blocks.append(f"{normalized_path}:\n" + "\n".join(numbered_lines))
+        return "\n\n".join(context_blocks)
+
+    def _route_contract_prompt(self, run_id: str) -> str:
+        route_path = get_run_workspace_path(run_id) / "app/ui/routes.py"
+        if not route_path.exists():
+            return ""
+        signatures = self._route_signatures(route_path.read_text(encoding="utf-8"))
+        if not signatures:
+            return ""
+        return "\n".join(
+            f"- {method.upper()} {path}: def {name}({args})"
+            for method, path, name, args in signatures
+        )
+
+    def _render_contract_prompt(self, run_id: str) -> str:
+        render_path = get_run_workspace_path(run_id) / "app/ui/render.py"
+        if not render_path.exists():
+            return ""
+        signatures = self._function_signatures(
+            render_path.read_text(encoding="utf-8"),
+            {"layout", "page", "page_with_auto_refresh", "status_badge"},
+        )
+        if not signatures:
+            return ""
+        return "\n".join(f"- def {name}({args})" for name, args in sorted(signatures.items()))
 
     def _build_review_request(self, request_text: str, retry_feedback: list[str]) -> str:
         if not retry_feedback:
@@ -633,10 +1373,21 @@ class OrchestrationService:
         )
 
     def _build_test_request(self, request_text: str, retry_feedback: list[str]) -> str:
+        whitelist_note = (
+            "Validation command whitelist: commands may only be one of 'ruff check .', "
+            "'mypy app', 'pytest -q', 'pytest tests -q', or 'pytest <test-path> -q'. "
+            "Do not put grep, find, test, python -c, shell pipelines, redirects, bash, sh, "
+            "awk, sed, or curl in commands."
+        )
         if not retry_feedback:
-            return request_text
+            return "\n".join([request_text, whitelist_note])
         return "\n".join(
-            [request_text, "Focus validation on prior failures being resolved:", *retry_feedback]
+            [
+                request_text,
+                whitelist_note,
+                "Focus validation on prior failures being resolved:",
+                *retry_feedback,
+            ]
         )
 
     def _invoke_stage(
@@ -660,7 +1411,7 @@ class OrchestrationService:
                 provider_name="lmstudio",
                 model_name=model_name,
             )
-            payload = json.loads(raw)
+            payload = self._load_stage_json(raw, stage.stage)
             return stage.schema.model_validate(payload)
 
         executor = ThreadPoolExecutor(max_workers=1)
@@ -733,8 +1484,17 @@ class OrchestrationService:
         user_prompt: str,
     ) -> BaseModel:
         raw = provider.structured_completion(system_prompt, user_prompt)
-        payload = json.loads(raw)
+        payload = self._load_stage_json(raw, stage.stage)
         return stage.schema.model_validate(payload)
+
+    def _load_stage_json(self, raw: str, stage_name: RunStage) -> object:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(
+                f"{stage_name} stage returned malformed JSON at line {exc.lineno}, "
+                f"column {exc.colno}."
+            ) from exc
 
     def _run_planner_with_guard(
         self,

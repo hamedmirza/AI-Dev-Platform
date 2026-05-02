@@ -8,6 +8,7 @@ Status legend:
 ## Core objective
 - `[x]` accept software tasks -> `app/api/routes/tasks.py`, `app/ui/routes.py`, `app/schemas/task.py`
 - `[x]` generate plans/architecture/code/review/test artifacts -> `app/services/orchestration_service.py`, `app/schemas/plan.py`, `app/schemas/architecture.py`, `app/schemas/code_change.py`, `app/schemas/review.py`, `app/schemas/test_result.py`
+- `[x]` generate UI/frontend design direction before coding -> `app/agents/ui_designer.py`, `app/agents/prompts/ui_designer.md`, `app/schemas/ui_design.py`
 - `[x]` apply AI-generated code patches in isolated run workspaces -> `app/schemas/code_change.py`, `app/services/orchestration_service.py`, `app/services/repository_service.py`
 - `[x]` loop on failures until escalation/completion -> `app/services/orchestration_service.py`
 - `[x]` expose API + UI workflow -> `app/api/main.py`, `app/api/routes/*.py`, `app/ui/routes.py`, `app/ui/render.py`

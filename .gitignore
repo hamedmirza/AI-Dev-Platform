@@ -31,6 +31,8 @@ ENV/
 .ruff_cache/
 .coverage
 htmlcov/
+node_modules/
+frontend/node_modules/
 
 # Environment and local secrets
 .env
