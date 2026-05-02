@@ -159,7 +159,50 @@ type AppData = {
   backups: BackupItem[];
 };
 
-const stages = ["planner", "architect", "ui_designer", "coder", "reviewer", "tester", "awaiting_approval"];
+/** Matches `RunStage` in the API (approval, not awaiting_approval). */
+const pipelineStageDefs: { id: string; label: string }[] = [
+  { id: "intake", label: "Intake" },
+  { id: "planner", label: "Planner" },
+  { id: "architect", label: "Architect" },
+  { id: "ui_designer", label: "UI designer" },
+  { id: "coder", label: "Coder" },
+  { id: "reviewer", label: "Reviewer" },
+  { id: "tester", label: "Tester" },
+  { id: "approval", label: "Approval" },
+  { id: "done", label: "Done" }
+];
+
+function humanizeSnake(s: string): string {
+  return s
+    .split(/[_\s]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function shouldShowArtifactTypeLabel(title: string, artifactType: string): boolean {
+  const ti = title.toLowerCase().trim();
+  const typeSlug = artifactType.toLowerCase().replace(/_/g, " ");
+  if (ti.endsWith(typeSlug)) return false;
+  const parts = artifactType.toLowerCase().split("_").filter((p) => p.length > 2);
+  for (const p of parts) {
+    if (ti.endsWith(p)) return false;
+  }
+  return true;
+}
+
+function formatTaskSecondaryText(task: TaskSummary): string {
+  const desc = (task.description || "").trim();
+  if (desc) return desc;
+  const rt = (task.request_text || "").trim();
+  const stripped = rt.replace(/^Title:\s*[^\n]+\s*\n\s*Description:\s*/i, "").trim();
+  if (stripped && stripped !== rt) return stripped;
+  return rt || "";
+}
+
+function shortRunId(id: string): string {
+  return id.length > 12 ? `${id.slice(0, 8)}…` : id;
+}
 
 const nav = [
   { key: "dashboard", label: "Dashboard", href: "/ui", icon: LayoutDashboard },
@@ -337,7 +380,6 @@ function App() {
             <button className="icon-button" type="button" title="Refresh" onClick={() => window.location.reload()}>
               <RefreshCw size={17} />
             </button>
-            <a className="button ghost" href="/ui/login">Login</a>
           </div>
         </header>
 
@@ -584,9 +626,9 @@ function RunCard({ run }: { run: RunSummary }) {
         <ChevronRight size={16} />
       </div>
       <strong>{run.task.title}</strong>
-      <span>{run.id}</span>
+      <span className="muted" title={run.id}>Run {shortRunId(run.id)}</span>
       <div className="chip-row">
-        <span>{run.current_stage}</span>
+        <span>{humanizeSnake(run.current_stage)}</span>
         <span>{run.provider_name}</span>
         <span>retries {run.retry_count}</span>
         <span>{run.created_at_human}</span>
@@ -801,6 +843,15 @@ function RunView(props: {
   onError: (message: string) => void;
 }) {
   const { run, events, artifacts, snapshots, diff, workspaceFiles, selectedFile, fileContent, onSelectFile, onFileContent, onNotice, onError } = props;
+
+  useEffect(() => {
+    const prev = document.title;
+    document.title = `${run.task.title} · ${shortRunId(run.id)}`;
+    return () => {
+      document.title = prev;
+    };
+  }, [run.id, run.task.title]);
+
   const act = async (action: string) => {
     try {
       const path = action === "cleanup" ? `/api/runs/${run.id}/cleanup-workspace` : `/api/runs/${run.id}/${action}`;
@@ -829,8 +880,11 @@ function RunView(props: {
         <div className="run-hero">
           <div>
             <p className="eyebrow">Run detail</p>
-            <h2>{run.id}</h2>
-            <p className="muted">{run.task.request_text}</p>
+            <h2>{run.task.title}</h2>
+            <p className="muted">
+              <span title={run.id}>Run ID {run.id}</span>
+            </p>
+            <p className="muted">{formatTaskSecondaryText(run.task)}</p>
           </div>
           <StatusPill value={run.status} />
         </div>
@@ -847,16 +901,23 @@ function RunView(props: {
           </div>
         ) : null}
         <div className="pipeline">
-          {stages.map((stage) => (
-            <div className={stage === run.current_stage || stage === run.status ? "stage active" : "stage"} key={stage}>
-              <CircleDot size={15} />
-              <span>{stage}</span>
-            </div>
-          ))}
+          {pipelineStageDefs.map(({ id, label }) => {
+            const active = id === run.current_stage;
+            return (
+              <div className={active ? "stage active" : "stage"} key={id}>
+                <CircleDot size={15} />
+                <span>{label}</span>
+              </div>
+            );
+          })}
         </div>
         <div className="action-row">
-          <button type="button" onClick={() => act("approve")}><Check size={16} /> Approve</button>
-          <button className="warn" type="button" onClick={() => act("reject")}><X size={16} /> Reject</button>
+          {run.status === "awaiting_approval" ? (
+            <>
+              <button type="button" onClick={() => act("approve")}><Check size={16} /> Approve</button>
+              <button className="warn" type="button" onClick={() => act("reject")}><X size={16} /> Reject</button>
+            </>
+          ) : null}
           <button className="ghost" type="button" onClick={() => act("retry")}><RefreshCw size={16} /> Retry</button>
           <button className="danger" type="button" onClick={() => act("abort")}><Square size={16} /> Abort</button>
           <button className="ghost" type="button" onClick={() => act("cleanup")}><Archive size={16} /> Cleanup</button>
@@ -875,7 +936,12 @@ function RunView(props: {
             {artifacts.length === 0 && <div className="empty">No artifacts recorded yet.</div>}
             {artifacts.map((artifact) => (
               <details className="artifact" key={artifact.id}>
-                <summary>{artifact.title} <span>{artifact.artifact_type}</span></summary>
+                <summary>
+                  {artifact.title}
+                  {shouldShowArtifactTypeLabel(artifact.title, artifact.artifact_type) ? (
+                    <span className="muted"> {humanizeSnake(artifact.artifact_type)}</span>
+                  ) : null}
+                </summary>
                 <pre>{artifact.content}</pre>
               </details>
             ))}
