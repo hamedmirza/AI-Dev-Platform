@@ -1,4 +1,4 @@
-import React, { FormEvent, useEffect, useMemo, useState } from "react";
+import React, { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -278,7 +278,7 @@ function App() {
   const [error, setError] = useState(new URLSearchParams(window.location.search).get("error") || "");
   const [loading, setLoading] = useState(true);
 
-  const loadGlobal = async () => {
+  const loadGlobal = useCallback(async () => {
     const [health, provider, repository, github, config, runs, backups] = await Promise.all([
       api<Health>("/api/health"),
       api<ProviderHealth>("/api/health/provider"),
@@ -289,9 +289,9 @@ function App() {
       api<BackupItem[]>("/api/backups")
     ]);
     setData({ health, provider, repository, github, config, runs, backups });
-  };
+  }, []);
 
-  const loadRun = async (id: string) => {
+  const loadRun = useCallback(async (id: string) => {
     const [runData, historyData, artifactData, snapshotData, diffData, filesData] = await Promise.all([
       api<RunSummary>(`/api/runs/${id}`),
       api<EventItem[]>(`/api/runs/${id}/history`),
@@ -306,32 +306,61 @@ function App() {
     setSnapshots(snapshotData);
     setDiff(diffData);
     setWorkspaceFiles(filesData.files);
-    if (filesData.files.length && !selectedFile) {
-      setSelectedFile(filesData.files[0]);
-    }
-  };
+    setSelectedFile((prev) => {
+      if (filesData.files.includes(prev)) return prev;
+      return filesData.files[0] ?? "";
+    });
+  }, []);
 
-  useEffect(() => {
-    const refresh = async () => {
+  const clearRunDetail = useCallback(() => {
+    setRun(null);
+    setEvents([]);
+    setArtifacts([]);
+    setSnapshots([]);
+    setDiff(null);
+    setWorkspaceFiles([]);
+    setSelectedFile("");
+    setFileContent("");
+  }, []);
+
+  const refreshAll = useCallback(
+    async (options?: { initial?: boolean }) => {
+      const initial = options?.initial ?? false;
       try {
-        setError("");
+        if (initial) setLoading(true);
+        else setError("");
         await loadGlobal();
         const nextView = currentView();
         setView(nextView);
         const id = runIdFromPath();
         if (id) {
           await loadRun(id);
+        } else {
+          clearRunDetail();
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unable to load console data.");
       } finally {
-        setLoading(false);
+        if (initial) setLoading(false);
       }
+    },
+    [loadGlobal, loadRun, clearRunDetail]
+  );
+
+  useEffect(() => {
+    void refreshAll({ initial: true });
+    const timer = window.setInterval(() => {
+      void refreshAll();
+    }, 5000);
+    const onPopState = () => {
+      void refreshAll();
     };
-    void refresh();
-    const timer = window.setInterval(refresh, 5000);
-    return () => window.clearInterval(timer);
-  }, []);
+    window.addEventListener("popstate", onPopState);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("popstate", onPopState);
+    };
+  }, [refreshAll]);
 
   useEffect(() => {
     if (!run || !selectedFile) return;
@@ -366,7 +395,10 @@ function App() {
         </nav>
         <div className="rail-footer">
           <StatusPill value={data.provider?.status || "loading"} />
-          <a href="/ui/logout">Logout</a>
+          <div className="rail-footer-links">
+            <a className="rail-link" href="/ui/login">Switch operator</a>
+            <a href="/ui/logout">Logout</a>
+          </div>
         </div>
       </aside>
 
@@ -377,7 +409,7 @@ function App() {
             <h1>{titleForView(view, run)}</h1>
           </div>
           <div className="top-actions">
-            <button className="icon-button" type="button" title="Refresh" onClick={() => window.location.reload()}>
+            <button className="icon-button" type="button" title="Refresh console data" onClick={() => void refreshAll()}>
               <RefreshCw size={17} />
             </button>
           </div>
@@ -388,12 +420,24 @@ function App() {
         {loading ? <LoadingPanel /> : null}
 
         {!loading && view === "dashboard" && (
-          <Dashboard data={data} onNotice={setNotice} onError={setError} />
+          <Dashboard
+            data={data}
+            onNotice={setNotice}
+            onError={setError}
+            onRefresh={refreshAll}
+            onRunCreated={async (runId) => {
+              window.history.pushState({}, "", `/ui/runs/${runId}`);
+              setView("run");
+              await refreshAll();
+            }}
+          />
         )}
         {!loading && view === "repository" && <RepositoryView repository={data.repository} />}
         {!loading && view === "provider" && <ProviderView data={data} />}
         {!loading && view === "settings" && <SettingsView config={data.config} onNotice={setNotice} onError={setError} />}
-        {!loading && view === "backups" && <BackupsView backups={data.backups} onNotice={setNotice} onError={setError} />}
+        {!loading && view === "backups" && (
+          <BackupsView backups={data.backups} onNotice={setNotice} onError={setError} onRefresh={refreshAll} />
+        )}
         {!loading && view === "run" && activeRun && run && (
           <RunView
             run={run}
@@ -408,6 +452,7 @@ function App() {
             onFileContent={setFileContent}
             onNotice={setNotice}
             onError={setError}
+            onRefresh={refreshAll}
           />
         )}
       </main>
@@ -446,7 +491,19 @@ function LoadingPanel() {
   );
 }
 
-function Dashboard({ data, onNotice, onError }: { data: AppData; onNotice: (message: string) => void; onError: (message: string) => void }) {
+function Dashboard({
+  data,
+  onNotice,
+  onError,
+  onRefresh,
+  onRunCreated
+}: {
+  data: AppData;
+  onNotice: (message: string) => void;
+  onError: (message: string) => void;
+  onRefresh: () => Promise<void>;
+  onRunCreated: (runId: string) => Promise<void>;
+}) {
   const lanes = useMemo(() => groupRuns(data.runs), [data.runs]);
   const activeCount = lanes.Active.length + lanes.Review.length;
   const issueCount = lanes.Blocked.length;
@@ -457,7 +514,7 @@ function Dashboard({ data, onNotice, onError }: { data: AppData; onNotice: (mess
         { method: "POST", body: "{}" }
       );
       onNotice(result.message);
-      window.location.reload();
+      await onRefresh();
     } catch (err) {
       onError(err instanceof Error ? err.message : "Run history cleanup failed.");
     }
@@ -471,7 +528,7 @@ function Dashboard({ data, onNotice, onError }: { data: AppData; onNotice: (mess
         <Metric icon={<Shield />} label="GitHub" value={data.github?.configured ? "configured" : "missing"} />
       </section>
       <section className="dashboard-grid">
-        <TaskComposer onNotice={onNotice} onError={onError} />
+        <TaskComposer onNotice={onNotice} onError={onError} onRunCreated={onRunCreated} />
         <section className="panel">
           <div className="panel-head">
             <div>
@@ -544,7 +601,15 @@ function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; 
   );
 }
 
-function TaskComposer({ onNotice, onError }: { onNotice: (message: string) => void; onError: (message: string) => void }) {
+function TaskComposer({
+  onNotice,
+  onError,
+  onRunCreated
+}: {
+  onNotice: (message: string) => void;
+  onError: (message: string) => void;
+  onRunCreated: (runId: string) => Promise<void>;
+}) {
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -576,8 +641,7 @@ function TaskComposer({ onNotice, onError }: { onNotice: (message: string) => vo
         })
       });
       onNotice(`Task created: ${created.run_id}`);
-      window.history.replaceState({}, "", `/ui/runs/${created.run_id}`);
-      window.location.assign(`/ui/runs/${created.run_id}`);
+      await onRunCreated(created.run_id);
     } catch (err) {
       onError(err instanceof Error ? err.message : "Task creation failed.");
     }
@@ -779,12 +843,22 @@ function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; o
   );
 }
 
-function BackupsView({ backups, onNotice, onError }: { backups: BackupItem[]; onNotice: (message: string) => void; onError: (message: string) => void }) {
+function BackupsView({
+  backups,
+  onNotice,
+  onError,
+  onRefresh
+}: {
+  backups: BackupItem[];
+  onNotice: (message: string) => void;
+  onError: (message: string) => void;
+  onRefresh: () => Promise<void>;
+}) {
   const createBackup = async () => {
     try {
       await api("/api/backups/run", { method: "POST", body: "{}" });
       onNotice("Backup created.");
-      window.location.reload();
+      await onRefresh();
     } catch (err) {
       onError(err instanceof Error ? err.message : "Backup failed.");
     }
@@ -841,8 +915,10 @@ function RunView(props: {
   onFileContent: (content: string) => void;
   onNotice: (message: string) => void;
   onError: (message: string) => void;
+  onRefresh: () => Promise<void>;
 }) {
-  const { run, events, artifacts, snapshots, diff, workspaceFiles, selectedFile, fileContent, onSelectFile, onFileContent, onNotice, onError } = props;
+  const { run, events, artifacts, snapshots, diff, workspaceFiles, selectedFile, fileContent, onSelectFile, onFileContent, onNotice, onError, onRefresh } =
+    props;
 
   useEffect(() => {
     const prev = document.title;
@@ -857,7 +933,7 @@ function RunView(props: {
       const path = action === "cleanup" ? `/api/runs/${run.id}/cleanup-workspace` : `/api/runs/${run.id}/${action}`;
       await api(path, { method: "POST", body: action === "cleanup" ? "{}" : JSON.stringify({ note: `Operator ${action}` }) });
       onNotice(`${action} requested.`);
-      window.location.reload();
+      await onRefresh();
     } catch (err) {
       onError(err instanceof Error ? err.message : `${action} failed.`);
     }
@@ -870,6 +946,7 @@ function RunView(props: {
         body: JSON.stringify({ path: selectedFile, content: fileContent })
       });
       onNotice("File saved.");
+      await onRefresh();
     } catch (err) {
       onError(err instanceof Error ? err.message : "File save failed.");
     }
