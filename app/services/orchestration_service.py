@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 
 from app.core.enums import ArtifactType, ProviderStatus, RunStage, RunStatus, StringEnum
@@ -26,19 +26,24 @@ from app.db.models import ArtifactModel, RunEventModel, RunModel, RunStateSnapsh
 from app.db.session import get_session_factory
 from app.graph.state import WorkflowState
 from app.providers.registry import get_provider, resolve_provider
+from app.providers.stage_models import effective_lmstudio_model_for_stage
 from app.schemas.architecture import ArchitectureResponse
 from app.schemas.code_change import CodeChangeResponse, FileChange, LineChange
 from app.schemas.plan import PlanResponse
 from app.schemas.review import ReviewResponse
 from app.schemas.test_result import TestResultResponse
 from app.schemas.ui_design import UIDesignResponse
+from app.services.lesson_service import load_lessons_prompt_prefix
+from app.services.playbook_service import load_active_playbook_overlay
 from app.services.repository_service import (
     create_run_workspace,
     delete_run_workspace_file,
     get_run_workspace_diff,
     get_run_workspace_path,
+    list_run_workspace_files,
     write_run_workspace_file,
 )
+from app.services.source_repo_policy import repo_key_for_source_spec, validate_source_repo_spec
 from app.tools.base import CommandResult
 from app.tools.command_runner import run_validation_command
 
@@ -151,10 +156,10 @@ class OrchestrationService:
     def __init__(self) -> None:
         self._queue: queue.Queue[str] = queue.Queue()
         self._stop_event = threading.Event()
-        self._worker_thread: Optional[threading.Thread] = None
+        self._worker_threads: list[threading.Thread] = []
 
     def start(self) -> None:
-        if self._worker_thread and self._worker_thread.is_alive():
+        if self._worker_threads and any(t.is_alive() for t in self._worker_threads):
             return
 
         settings = get_settings()
@@ -163,22 +168,32 @@ class OrchestrationService:
         recovered_pending_runs = self._recover_interrupted_runs()
         provider_health = get_provider().health_check()
         if provider_health.status == ProviderStatus.UNAVAILABLE:
-            raise ProviderError(provider_health.detail)
+            logger.warning(
+                "LM provider unavailable at orchestration startup; runs may fail until it "
+                "recovers. detail=%s",
+                provider_health.detail,
+            )
 
         self._stop_event.clear()
-        self._worker_thread = threading.Thread(
-            target=self._run_loop,
-            name="orchestration-worker",
-            daemon=True,
-        )
-        self._worker_thread.start()
+        worker_count = max(1, int(settings.worker_count))
+        self._worker_threads = []
+        for index in range(worker_count):
+            thread = threading.Thread(
+                target=self._run_loop,
+                name=f"orchestration-worker-{index}",
+                daemon=True,
+            )
+            self._worker_threads.append(thread)
+            thread.start()
         for run_id in recovered_pending_runs:
             self.enqueue_run(run_id)
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=30)
+        for thread in self._worker_threads:
+            if thread.is_alive():
+                thread.join(timeout=30)
+        self._worker_threads.clear()
 
     def enqueue_run(self, run_id: str) -> None:
         self._queue.put(run_id)
@@ -254,8 +269,18 @@ class OrchestrationService:
 
             workflow_state = self._build_workflow_state(run, task)
 
-            provider = resolve_provider(task.provider_override, task.model_override)
-            workspace_path = create_run_workspace(run.id)
+            if (task.source_repo_spec or "").strip():
+                try:
+                    validate_source_repo_spec(task.source_repo_spec.strip(), get_settings())
+                except ConfigurationError as exc:
+                    run.status = RunStatus.FAILED
+                    run.current_stage = RunStage.INTAKE
+                    run.error_message = str(exc)
+                    self._add_event(session, run.id, "source_repo_invalid", str(exc))
+                    session.commit()
+                    return
+
+            workspace_path = create_run_workspace(run.id, task)
             run.status = RunStatus.RUNNING
             self._add_event(
                 session,
@@ -279,12 +304,18 @@ class OrchestrationService:
             reviewer_stage = self._stage_by_name(RunStage.REVIEWER)
             tester_stage = self._stage_by_name(RunStage.TESTER)
 
+            planner_request = task.request_text
+            settings = get_settings()
+            if settings.use_scout_stage or task.use_scout:
+                scout_block = self._build_scout_preamble(run.id)
+                planner_request = f"{scout_block}\n\n{task.request_text}"
+
             planner_model = self._run_planner_with_guard(
                 session=session,
                 run=run,
-                provider=provider,
+                task=task,
                 stage=planner_stage,
-                request_text=task.request_text,
+                request_text=planner_request,
                 workflow_state=workflow_state,
             )
             if planner_model is None:
@@ -292,12 +323,24 @@ class OrchestrationService:
             workflow_state["planner_output"] = planner_model.model_dump_json()
             architect_model = cast(
                 ArchitectureResponse,
-                self._run_stage(session, run, provider, architect_stage, task.request_text),
+                self._run_stage_with_provider_retries(
+                    session,
+                    run,
+                    task,
+                    architect_stage,
+                    task.request_text,
+                ),
             )
             workflow_state["architecture_output"] = architect_model.model_dump_json()
             ui_design_model = cast(
                 UIDesignResponse,
-                self._run_stage(session, run, provider, ui_designer_stage, task.request_text),
+                self._run_stage_with_provider_retries(
+                    session,
+                    run,
+                    task,
+                    ui_designer_stage,
+                    task.request_text,
+                ),
             )
             workflow_state["ui_design_output"] = ui_design_model.model_dump_json()
 
@@ -319,7 +362,7 @@ class OrchestrationService:
                 try:
                     code_model = cast(
                         CodeChangeResponse,
-                        self._run_stage(session, run, provider, coder_stage, coder_prompt),
+                        self._run_stage(session, run, task, coder_stage, coder_prompt),
                     )
                 except ProviderError as exc:
                     test_retries += 1
@@ -405,7 +448,13 @@ class OrchestrationService:
                 review_prompt = self._build_review_request(task.request_text, retry_feedback)
                 review_model = cast(
                     ReviewResponse,
-                    self._run_stage(session, run, provider, reviewer_stage, review_prompt),
+                    self._run_stage_with_provider_retries(
+                        session,
+                        run,
+                        task,
+                        reviewer_stage,
+                        review_prompt,
+                    ),
                 )
                 workflow_state["review_output"] = review_model.model_dump_json()
                 if not review_model.approved:
@@ -449,7 +498,13 @@ class OrchestrationService:
                 test_prompt = self._build_test_request(task.request_text, retry_feedback)
                 test_model = cast(
                     TestResultResponse,
-                    self._run_stage(session, run, provider, tester_stage, test_prompt),
+                    self._run_stage_with_provider_retries(
+                        session,
+                        run,
+                        task,
+                        tester_stage,
+                        test_prompt,
+                    ),
                 )
                 local_validation_passed, local_failures = self._run_local_validation(
                     session,
@@ -537,27 +592,50 @@ class OrchestrationService:
                 return stage
         raise ProviderError(f"Stage definition missing for {stage_name}.")
 
+    def _build_scout_preamble(self, run_id: str) -> str:
+        snapshot = list_run_workspace_files(run_id)
+        files = snapshot.get("files") if isinstance(snapshot, dict) else []
+        if not isinstance(files, list):
+            files = []
+        trimmed = [str(f) for f in files[:120]]
+        lines = "\n".join(f"- {path}" for path in trimmed)
+        return (
+            "Scout: repository file tree (read-only, truncated). Use it to orient the plan.\n"
+            f"{lines}"
+        )
+
     def _run_stage(
         self,
         session,
         run: RunModel,
-        provider,
+        task: TaskModel,
         stage: StageDefinition,
         request_text: str,
         timeout_seconds: Optional[float] = None,
     ) -> BaseModel:
+        settings = get_settings()
+        model_name = effective_lmstudio_model_for_stage(task, stage.stage, settings)
+        provider = resolve_provider(task.provider_override, model_name)
         run.current_stage = stage.stage
-        self._add_event(session, run.id, f"{stage.stage}_started", f"Started {stage.stage} stage.")
+        stage_name = stage.stage.value
+        self._add_event(session, run.id, f"{stage_name}_started", f"Started {stage_name} stage.")
         self._record_state_snapshot(
             session,
             run,
             self._build_state_for_stage(run, stage.stage),
-            current_step=f"{stage.stage}_started",
-            payload={"stage": stage.stage},
+            current_step=f"{stage_name}_started",
+            payload={"stage": stage_name},
         )
         session.commit()
 
-        model = self._invoke_stage(provider, stage, request_text, timeout_seconds=timeout_seconds)
+        model = self._invoke_stage(
+            session,
+            task,
+            provider,
+            stage,
+            request_text,
+            timeout_seconds=timeout_seconds,
+        )
         session.add(
             self._make_artifact(
                 run.id,
@@ -569,19 +647,78 @@ class OrchestrationService:
         self._add_event(
             session,
             run.id,
-            f"{stage.stage}_completed",
-            f"Completed {stage.stage} stage.",
+            f"{stage_name}_completed",
+            f"Completed {stage_name} stage.",
             model.model_dump_json(),
         )
         self._record_state_snapshot(
             session,
             run,
             self._build_state_for_stage(run, stage.stage),
-            current_step=f"{stage.stage}_completed",
+            current_step=f"{stage_name}_completed",
             payload=model.model_dump(),
         )
         session.commit()
         return model
+
+    def _run_stage_with_provider_retries(
+        self,
+        session,
+        run: RunModel,
+        task: TaskModel,
+        stage: StageDefinition,
+        request_text: str,
+        attempts: int = 3,
+    ) -> BaseModel:
+        current_request = request_text
+        stage_name = stage.stage.value
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._run_stage(session, run, task, stage, current_request)
+            except (ProviderError, ValidationError) as exc:
+                if attempt >= attempts or not self._is_retryable_stage_output_error(exc):
+                    raise
+
+                feedback = (
+                    f"{stage_name} stage returned invalid structured output on attempt "
+                    f"{attempt}/{attempts}: {exc}"
+                )
+                self._add_event(
+                    session,
+                    run.id,
+                    f"{stage_name}_retry",
+                    "Stage returned invalid structured output; retrying with stricter JSON "
+                    "instructions.",
+                    json.dumps({"attempt": attempt, "error": str(exc)}, indent=2),
+                )
+                session.commit()
+                current_request = (
+                    f"{request_text}\n\nRetry feedback:\n"
+                    f"- {feedback}\n"
+                    "- Return valid JSON only.\n"
+                    "- Do not include Markdown fences, comments, trailing commas, or prose outside "
+                    "the JSON object.\n"
+                    "- Ensure every required key matches the requested schema."
+                )
+
+        raise ProviderError(f"{stage_name} stage failed to return valid structured output.")
+
+    def _is_retryable_stage_output_error(self, exc: Exception) -> bool:
+        if isinstance(exc, ValidationError):
+            return True
+        if not isinstance(exc, ProviderError):
+            return False
+        message = str(exc).lower()
+        return any(
+            phrase in message
+            for phrase in (
+                "malformed json",
+                "invalid json",
+                "schema",
+                "validation",
+                "valid json",
+            )
+        )
 
     def _apply_code_changes(
         self,
@@ -1392,6 +1529,8 @@ class OrchestrationService:
 
     def _invoke_stage(
         self,
+        session,
+        task: TaskModel,
         provider,
         stage: StageDefinition,
         request_text: str,
@@ -1399,7 +1538,13 @@ class OrchestrationService:
     ) -> BaseModel:
         prompt_path = Path(stage.system_prompt_path)
         system_prompt = prompt_path.read_text(encoding="utf-8").strip()
+        repo_key = repo_key_for_source_spec(task.source_repo_spec)
+        overlay = load_active_playbook_overlay(session, repo_key, stage.stage)
+        if overlay:
+            system_prompt = f"{system_prompt}\n\n--- Approved playbook overlay ---\n{overlay}"
         user_prompt = stage.user_prompt_template.format(request_text=request_text)
+        if stage.stage == RunStage.PLANNER:
+            user_prompt = load_lessons_prompt_prefix(session, repo_key) + user_prompt
         if timeout_seconds is None:
             return self._complete_stage(provider, stage, system_prompt, user_prompt)
         if provider.__class__.__name__ == "LMStudioProvider":
@@ -1500,7 +1645,7 @@ class OrchestrationService:
         self,
         session,
         run: RunModel,
-        provider,
+        task: TaskModel,
         stage: StageDefinition,
         request_text: str,
         workflow_state: WorkflowState,
@@ -1527,7 +1672,7 @@ class OrchestrationService:
                     self._run_stage(
                         session,
                         run,
-                        provider,
+                        task,
                         stage,
                         request_text,
                         timeout_seconds=timeout_seconds,

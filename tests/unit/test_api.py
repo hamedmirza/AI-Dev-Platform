@@ -1,13 +1,14 @@
 import json
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 
-from app.core.enums import ProviderStatus
+from app.core.enums import ProviderStatus, RunStage, RunStatus
 from app.core.settings import clear_settings_cache
 from app.db.models import RunModel, TaskModel
 from app.db.session import get_session_factory, init_db
@@ -105,9 +106,7 @@ class FakeProvider(BaseProvider):
 
 class SlowPlannerProvider(FakeProvider):
     def invoke_json(self, system_prompt: str, user_prompt: str) -> str:
-        prompt = f"{system_prompt}\n{user_prompt}".lower()
-        if "summary, assumptions, risks, steps" in prompt:
-            time.sleep(0.2)
+        time.sleep(0.2)
         return super().invoke_json(system_prompt, user_prompt)
 
 
@@ -116,6 +115,19 @@ class MalformedCoderProvider(FakeProvider):
         prompt = f"{system_prompt}\n{user_prompt}".lower()
         if "changed_files" in prompt:
             return "{not-json"
+        return super().invoke_json(system_prompt, user_prompt)
+
+
+class MalformedUIDesignerOnceProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.malformed_ui_remaining = 1
+
+    def invoke_json(self, system_prompt: str, user_prompt: str) -> str:
+        prompt = f"{system_prompt}\n{user_prompt}".lower()
+        if "visual_system" in prompt and self.malformed_ui_remaining > 0:
+            self.malformed_ui_remaining -= 1
+            return '{"design_summary": "broken", "visual_system": ["unterminated]'
         return super().invoke_json(system_prompt, user_prompt)
 
 
@@ -341,7 +353,7 @@ def wait_for_run_status(
     expected_statuses: set[str],
 ) -> str:
     status = ""
-    for _ in range(200):
+    for _ in range(600):
         run_response = client.get(f"/api/runs/{run_id}", headers=headers)
         assert run_response.status_code == 200
         status = run_response.json()["status"]
@@ -353,6 +365,21 @@ def wait_for_run_status(
     )
 
 
+def test_health_live_and_ready(tmp_path: Path, monkeypatch) -> None:
+    client = build_client(tmp_path, monkeypatch)
+    with client:
+        live = client.get("/api/health/live")
+        assert live.status_code == 200
+        assert live.json() == {"status": "live"}
+
+        ready = client.get("/api/health/ready")
+        assert ready.status_code == 200
+        body = ready.json()
+        assert body["status"] == "ready"
+        assert body["database"] == "ok"
+        assert "provider" in body
+
+
 def test_health_endpoint(tmp_path: Path, monkeypatch) -> None:
     client = build_client(tmp_path, monkeypatch)
     with client:
@@ -360,6 +387,72 @@ def test_health_endpoint(tmp_path: Path, monkeypatch) -> None:
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
         assert response.headers["x-request-id"]
+
+
+def test_clear_terminal_history_preserves_active_runs(tmp_path: Path, monkeypatch) -> None:
+    client = build_client(tmp_path, monkeypatch)
+    headers = {"X-API-Token": "test-token"}
+    with client:
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            active_task = TaskModel(title="Active", request_text="Keep active run")
+            old_tasks = [
+                TaskModel(title=f"Old {index}", request_text=f"Remove old {index}")
+                for index in range(3)
+            ]
+            kept_task = TaskModel(title="Kept", request_text="Keep newest terminal run")
+            session.add_all([active_task, kept_task, *old_tasks])
+            session.flush()
+            base_time = datetime.now(timezone.utc) - timedelta(hours=1)
+
+            active_run = RunModel(
+                task_id=active_task.id,
+                status=RunStatus.RUNNING,
+                current_stage=RunStage.CODER,
+                provider_name="fake",
+                created_at=base_time + timedelta(minutes=10),
+                updated_at=base_time + timedelta(minutes=10),
+            )
+            kept_run = RunModel(
+                task_id=kept_task.id,
+                status=RunStatus.COMPLETED,
+                current_stage=RunStage.DONE,
+                provider_name="fake",
+                created_at=base_time + timedelta(minutes=20),
+                updated_at=base_time + timedelta(minutes=20),
+            )
+            old_runs = [
+                RunModel(
+                    task_id=task.id,
+                    status=RunStatus.FAILED,
+                    current_stage=RunStage.TESTER,
+                    provider_name="fake",
+                    created_at=base_time + timedelta(minutes=index),
+                    updated_at=base_time + timedelta(minutes=index),
+                )
+                for index, task in enumerate(old_tasks)
+            ]
+            session.add_all([active_run, kept_run, *old_runs])
+            session.commit()
+            active_run_id = active_run.id
+            kept_run_id = kept_run.id
+
+        response = client.post(
+            "/api/runs/clear-terminal-history?keep_latest=1",
+            headers=headers,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["deleted_runs"] == 3
+        assert body["deleted_tasks"] == 3
+        assert body["kept_terminal_runs"] == 1
+
+        runs = client.get("/api/runs?limit=10", headers=headers)
+        assert runs.status_code == 200
+        run_ids = {item["id"] for item in runs.json()}
+        assert active_run_id in run_ids
+        assert kept_run_id in run_ids
+        assert len(run_ids) == 2
 
         provider = client.get("/api/health/provider")
         assert provider.status_code == 200
@@ -582,6 +675,36 @@ def test_malformed_coder_json_fails_run_cleanly(tmp_path: Path, monkeypatch) -> 
         event_types = [item["event_type"] for item in history.json()]
         assert event_types.count("coder_stage_failed") == 3
         assert "run_blocked" in event_types
+
+
+def test_malformed_ui_designer_json_retries_and_recovers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client = build_client(tmp_path, monkeypatch, provider=MalformedUIDesignerOnceProvider())
+    headers = {"x-api-token": "test-token"}
+
+    with client:
+        response = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "title": "Recover malformed UI design",
+                "request_text": "Create a small safe documentation update.",
+            },
+        )
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+
+        assert wait_for_run_status(client, run_id, headers, {"awaiting_approval"}) == (
+            "awaiting_approval"
+        )
+
+        history = client.get(f"/api/runs/{run_id}/history", headers=headers)
+        assert history.status_code == 200
+        event_types = [item["event_type"] for item in history.json()]
+        assert "ui_designer_retry" in event_types
+        assert "awaiting_approval" in event_types
 
 
 def test_patch_scope_guard_blocks_files_outside_task_targets(

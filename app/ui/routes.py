@@ -18,6 +18,7 @@ from app.schemas.task import TaskCreate
 from app.services.artifact_service import list_artifacts
 from app.services.backup_service import create_backup, rehearse_restore
 from app.services.github_service import get_github_status
+from app.services.lmstudio_models_service import fetch_lmstudio_models
 from app.services.orchestration_service import get_orchestration_service
 from app.services.repository_service import (
     get_repository_summary,
@@ -170,25 +171,57 @@ def _render_backups() -> str:
 
 def _settings_form(settings) -> str:
     local_values = load_local_settings()
+    models, models_err = fetch_lmstudio_models(settings)
+    datalist_options = "".join(
+        f'<option value="{escape(str(item.get("id", "")))}"></option>'
+        for item in models
+        if isinstance(item, dict) and item.get("id")
+    )
+    models_err_html = (
+        f'<p class="meta">LM Studio model list: {escape(models_err)}</p>' if models_err else ""
+    )
 
     def value(key: str, fallback: str) -> str:
         return escape(local_values.get(key, fallback))
 
+    def lm_field(name: str, fallback: str) -> str:
+        return (
+            f'<input type="text" name="{name}" list="lmstudio-model-ids" '
+            f'value="{value(name, fallback)}" placeholder="{name}">'
+        )
+
     return f"""
     <form method="post" action="/ui/settings">
+      <datalist id="lmstudio-model-ids">{datalist_options}</datalist>
+      {models_err_html}
       <input type="text" name="APP_HOST" value="{value("APP_HOST", settings.app_host)}" placeholder="APP_HOST">
       <input type="text" name="APP_PORT" value="{value("APP_PORT", str(settings.app_port))}" placeholder="APP_PORT">
       <input type="text" name="APP_API_TOKEN" value="{value("APP_API_TOKEN", settings.app_api_token)}" placeholder="APP_API_TOKEN">
+      <input type="text" name="WORKER_COUNT" value="{value("WORKER_COUNT", str(settings.worker_count))}" placeholder="WORKER_COUNT">
       <input type="text" name="LMSTUDIO_BASE_URL" value="{value("LMSTUDIO_BASE_URL", settings.lmstudio_base_url)}" placeholder="LMSTUDIO_BASE_URL">
-      <input type="text" name="LMSTUDIO_MODEL" value="{value("LMSTUDIO_MODEL", settings.lmstudio_model)}" placeholder="LMSTUDIO_MODEL">
+      {lm_field("LMSTUDIO_MODEL", settings.lmstudio_model)}
+      {lm_field("LMSTUDIO_MODEL_PLANNER", settings.lmstudio_model_planner or "")}
+      {lm_field("LMSTUDIO_MODEL_ARCHITECT", settings.lmstudio_model_architect or "")}
+      {lm_field("LMSTUDIO_MODEL_UI_DESIGNER", settings.lmstudio_model_ui_designer or "")}
+      {lm_field("LMSTUDIO_MODEL_CODER", settings.lmstudio_model_coder or "")}
+      {lm_field("LMSTUDIO_MODEL_REVIEWER", settings.lmstudio_model_reviewer or "")}
+      {lm_field("LMSTUDIO_MODEL_TESTER", settings.lmstudio_model_tester or "")}
+      {lm_field("LMSTUDIO_MODEL_SUPERVISOR", settings.lmstudio_model_supervisor or "")}
       <input type="text" name="LMSTUDIO_API_KEY" value="{value("LMSTUDIO_API_KEY", settings.lmstudio_api_key)}" placeholder="LMSTUDIO_API_KEY">
       <input type="text" name="PROVIDER_TIMEOUT_SECONDS" value="{value("PROVIDER_TIMEOUT_SECONDS", str(settings.provider_timeout_seconds))}" placeholder="PROVIDER_TIMEOUT_SECONDS">
+      <input type="text" name="GIT_CLONE_TIMEOUT_SECONDS" value="{value("GIT_CLONE_TIMEOUT_SECONDS", str(settings.git_clone_timeout_seconds))}" placeholder="GIT_CLONE_TIMEOUT_SECONDS">
       <input type="text" name="SOURCE_REPO_PATH" value="{value("SOURCE_REPO_PATH", str(settings.source_repo_path_resolved or ""))}" placeholder="SOURCE_REPO_PATH">
+      <input type="text" name="ALLOWED_GIT_HOSTS" value="{value("ALLOWED_GIT_HOSTS", settings.allowed_git_hosts)}" placeholder="ALLOWED_GIT_HOSTS (comma hosts)">
+      <input type="text" name="ALLOWED_SOURCE_REPO_ROOTS" value="{value("ALLOWED_SOURCE_REPO_ROOTS", settings.allowed_source_repo_roots)}" placeholder="ALLOWED_SOURCE_REPO_ROOTS">
       <input type="text" name="WORKSPACE_ROOT" value="{value("WORKSPACE_ROOT", str(settings.workspace_root_path))}" placeholder="WORKSPACE_ROOT">
       <input type="text" name="BACKUP_ROOT" value="{value("BACKUP_ROOT", str(settings.backup_root_path))}" placeholder="BACKUP_ROOT">
       <input type="text" name="GIT_AUTHOR_NAME" value="{value("GIT_AUTHOR_NAME", settings.git_author_name)}" placeholder="GIT_AUTHOR_NAME">
       <input type="text" name="GIT_AUTHOR_EMAIL" value="{value("GIT_AUTHOR_EMAIL", settings.git_author_email)}" placeholder="GIT_AUTHOR_EMAIL">
       <input type="text" name="LOG_LEVEL" value="{value("LOG_LEVEL", settings.log_level)}" placeholder="LOG_LEVEL">
+      <input type="text" name="USE_SCOUT_STAGE" value="{value("USE_SCOUT_STAGE", str(settings.use_scout_stage).lower())}" placeholder="USE_SCOUT_STAGE (true/false)">
+      <input type="text" name="PLAYBOOK_SUPERVISOR_ENABLED" value="{value("PLAYBOOK_SUPERVISOR_ENABLED", str(settings.playbook_supervisor_enabled).lower())}" placeholder="PLAYBOOK_SUPERVISOR_ENABLED">
+      <input type="text" name="PLAYBOOK_REQUIRE_HUMAN_CONFIRM" value="{value("PLAYBOOK_REQUIRE_HUMAN_CONFIRM", str(settings.playbook_require_human_confirm).lower())}" placeholder="PLAYBOOK_REQUIRE_HUMAN_CONFIRM">
+      <input type="text" name="PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH" value="{value("PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH", settings.playbook_supervisor_system_prompt_path)}" placeholder="PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH">
       <button type="submit">Save Local Settings</button>
     </form>
     """
@@ -556,16 +589,33 @@ def settings_submit(
     APP_HOST: str = Form(...),
     APP_PORT: str = Form(...),
     APP_API_TOKEN: str = Form(...),
+    WORKER_COUNT: str = Form("1"),
     LMSTUDIO_BASE_URL: str = Form(...),
     LMSTUDIO_MODEL: str = Form(...),
+    LMSTUDIO_MODEL_PLANNER: str = Form(""),
+    LMSTUDIO_MODEL_ARCHITECT: str = Form(""),
+    LMSTUDIO_MODEL_UI_DESIGNER: str = Form(""),
+    LMSTUDIO_MODEL_CODER: str = Form(""),
+    LMSTUDIO_MODEL_REVIEWER: str = Form(""),
+    LMSTUDIO_MODEL_TESTER: str = Form(""),
+    LMSTUDIO_MODEL_SUPERVISOR: str = Form(""),
     LMSTUDIO_API_KEY: str = Form(...),
     PROVIDER_TIMEOUT_SECONDS: str = Form(...),
+    GIT_CLONE_TIMEOUT_SECONDS: str = Form("300"),
     SOURCE_REPO_PATH: str = Form(""),
+    ALLOWED_GIT_HOSTS: str = Form(""),
+    ALLOWED_SOURCE_REPO_ROOTS: str = Form(""),
     WORKSPACE_ROOT: str = Form(...),
     BACKUP_ROOT: str = Form(...),
     GIT_AUTHOR_NAME: str = Form(...),
     GIT_AUTHOR_EMAIL: str = Form(...),
     LOG_LEVEL: str = Form(...),
+    USE_SCOUT_STAGE: str = Form("false"),
+    PLAYBOOK_SUPERVISOR_ENABLED: str = Form("false"),
+    PLAYBOOK_REQUIRE_HUMAN_CONFIRM: str = Form("true"),
+    PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH: str = Form(
+        "app/agents/prompts/playbook_supervisor.md",
+    ),
 ):
     redirect = _require_authorized(request)
     if redirect:
@@ -578,16 +628,31 @@ def settings_submit(
             "APP_HOST": APP_HOST,
             "APP_PORT": APP_PORT,
             "APP_API_TOKEN": next_token,
+            "WORKER_COUNT": WORKER_COUNT,
             "LMSTUDIO_BASE_URL": LMSTUDIO_BASE_URL,
             "LMSTUDIO_MODEL": LMSTUDIO_MODEL,
+            "LMSTUDIO_MODEL_PLANNER": LMSTUDIO_MODEL_PLANNER,
+            "LMSTUDIO_MODEL_ARCHITECT": LMSTUDIO_MODEL_ARCHITECT,
+            "LMSTUDIO_MODEL_UI_DESIGNER": LMSTUDIO_MODEL_UI_DESIGNER,
+            "LMSTUDIO_MODEL_CODER": LMSTUDIO_MODEL_CODER,
+            "LMSTUDIO_MODEL_REVIEWER": LMSTUDIO_MODEL_REVIEWER,
+            "LMSTUDIO_MODEL_TESTER": LMSTUDIO_MODEL_TESTER,
+            "LMSTUDIO_MODEL_SUPERVISOR": LMSTUDIO_MODEL_SUPERVISOR,
             "LMSTUDIO_API_KEY": LMSTUDIO_API_KEY,
             "PROVIDER_TIMEOUT_SECONDS": PROVIDER_TIMEOUT_SECONDS,
+            "GIT_CLONE_TIMEOUT_SECONDS": GIT_CLONE_TIMEOUT_SECONDS,
             "SOURCE_REPO_PATH": SOURCE_REPO_PATH,
+            "ALLOWED_GIT_HOSTS": ALLOWED_GIT_HOSTS,
+            "ALLOWED_SOURCE_REPO_ROOTS": ALLOWED_SOURCE_REPO_ROOTS,
             "WORKSPACE_ROOT": WORKSPACE_ROOT,
             "BACKUP_ROOT": BACKUP_ROOT,
             "GIT_AUTHOR_NAME": GIT_AUTHOR_NAME,
             "GIT_AUTHOR_EMAIL": GIT_AUTHOR_EMAIL,
             "LOG_LEVEL": LOG_LEVEL,
+            "USE_SCOUT_STAGE": USE_SCOUT_STAGE,
+            "PLAYBOOK_SUPERVISOR_ENABLED": PLAYBOOK_SUPERVISOR_ENABLED,
+            "PLAYBOOK_REQUIRE_HUMAN_CONFIRM": PLAYBOOK_REQUIRE_HUMAN_CONFIRM,
+            "PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH": PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH,
         }
     )
     response = RedirectResponse("/ui/settings?success=Settings+saved.", status_code=303)
@@ -602,34 +667,6 @@ def backups_page(request: Request):
     if redirect:
         return redirect
     return HTMLResponse(react_app_shell("Backups"))
-
-    body = f"""
-    <section class="panel hero">
-      <div class="eyebrow">Backups</div>
-      <h2>Create and rehearse local recovery sets.</h2>
-      <p>
-        Backups include the SQLite database and manifest metadata. Restore rehearsal copies the DB
-        into a non-live location so recovery can be tested without touching the active database.
-      </p>
-    </section>
-    <section class="panel">
-      <div class="section-head">
-        <h2>Backup Controls</h2>
-        <form method="post" action="/ui/backups/run">
-          <button type="submit">Create Backup</button>
-        </form>
-      </div>
-      <div class="list">{_render_backups()}</div>
-    </section>
-    """
-    html = layout(
-        "Backups",
-        "Local backup and restore rehearsal tools.",
-        _nav(),
-        body,
-        _sidebar("backups"),
-    )
-    return HTMLResponse(page("Backups", html))
 
 
 @router.get("/ui/login", response_class=HTMLResponse)

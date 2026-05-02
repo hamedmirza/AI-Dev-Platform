@@ -168,7 +168,8 @@ h2 {
 
 .top-actions,
 .action-row,
-.chip-row {
+.chip-row,
+.panel-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
@@ -219,6 +220,13 @@ button.danger {
 .icon-button {
   width: 38px;
   padding: 0;
+}
+
+button.compact,
+.button.compact {
+  min-height: 32px;
+  padding: 6px 10px;
+  font-size: 0.82rem;
 }
 
 .stack {
@@ -345,6 +353,16 @@ textarea:focus {
   font-size: 0.83rem;
   font-weight: 800;
   text-transform: uppercase;
+}
+
+.lane-empty {
+  display: grid;
+  place-items: center;
+  min-height: 64px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  color: var(--faint);
+  font-size: 0.8rem;
 }
 
 .run-card {

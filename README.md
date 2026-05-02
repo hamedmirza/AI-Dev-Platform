@@ -20,12 +20,12 @@ This repo is now a working local-first software delivery platform with:
 ## Architecture Diagram (Text)
 ```text
 User/API/UI
-  -> FastAPI routes (tasks, runs, health, config, backups, UI)
-    -> Services (task/run/orchestration/repository/artifacts/settings)
-      -> Provider registry -> LM Studio provider (OpenAI-compatible API)
-      -> Tools (workspace guard, filesystem, git, diff, command runner)
-      -> SQLite persistence (tasks, runs, events, artifacts, state snapshots)
-    -> Operator UI (server-rendered pages for run control and inspection)
+  -> FastAPI routes (tasks, runs, health, config, playbooks, lessons, backups, UI)
+    -> Orchestration (queued runs, WORKER_COUNT worker threads, STAGES pipeline)
+      -> Provider registry -> LM Studio (per-stage model selection)
+      -> Tools (workspace guard, filesystem, git clone per task, diff, command runner)
+      -> SQLite persistence (tasks, runs, events, artifacts, lessons, playbooks)
+    -> Operator UI (React console + server-rendered settings)
 ```
 
 ## Local Run
@@ -46,12 +46,23 @@ Core:
 - `MODEL_PROVIDER` (default: `lmstudio`)
 - `LMSTUDIO_BASE_URL` (default: `http://localhost:1234/v1`)
 - `LMSTUDIO_MODEL` (default: `qwen2.5-coder-14b-instruct`)
+- `LMSTUDIO_MODEL_PLANNER`, `LMSTUDIO_MODEL_ARCHITECT`, `LMSTUDIO_MODEL_UI_DESIGNER`, `LMSTUDIO_MODEL_CODER`, `LMSTUDIO_MODEL_REVIEWER`, `LMSTUDIO_MODEL_TESTER`, `LMSTUDIO_MODEL_SUPERVISOR` (optional; fall back to `LMSTUDIO_MODEL` when unset)
 - `LMSTUDIO_API_KEY` (default: `lm-studio`)
 - `PROVIDER_TIMEOUT_SECONDS` (default: `60`)
-- `SOURCE_REPO_PATH` (absolute path to this repo’s checkout on disk; used when cloning into run workspaces)
+- `GIT_CLONE_TIMEOUT_SECONDS` (default: `300`) — timeout for `git clone` of remote task repositories
+- `SOURCE_REPO_PATH` (absolute path to this repo’s checkout on disk; default clone source when a task has no `source_repo`)
+- `ALLOWED_GIT_HOSTS` (comma-separated hostnames; **required** for remote `source_repo` HTTPS/SSH URLs on tasks)
+- `ALLOWED_SOURCE_REPO_ROOTS` (optional comma-separated absolute path prefixes constraining **local** task `source_repo` paths)
 - `WORKSPACE_ROOT` (default: `./workspace`)
 - `BACKUP_ROOT` (default: `./backups`)
+- `WORKER_COUNT` (default: `1`) — number of orchestration worker threads draining the run queue
+- `USE_SCOUT_STAGE` (default: `false`) — prepend read-only file-tree scout block for every run’s planner (can also enable per task with `use_scout`)
+- `PLAYBOOK_SUPERVISOR_ENABLED`, `PLAYBOOK_REQUIRE_HUMAN_CONFIRM`, `PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH` — supervised playbook pipeline (see `/api/playbooks`)
 - `LOG_LEVEL` (default: `INFO`)
+
+### Git credentials for remote `source_repo`
+
+Clones run non-interactively with `GIT_TERMINAL_PROMPT=0`. Configure machine-level git credentials (`~/.netrc`, SSH agent, or deploy keys) for private remotes. Credentials are **not** isolated per app unless you use separate OS users or SSH configs; see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for collaboration hygiene.
 
 ## LM Studio Startup
 1. Start LM Studio locally and load your coding model.
@@ -77,7 +88,7 @@ Core:
 - local repository workspace cloning and cleanup
 
 ## Frontend Build
-The production UI is a standalone React/Vite bundle served by FastAPI from `/ui`.
+The production UI is a standalone React/Vite bundle served by FastAPI from `/ui`. The **Dockerfile** runs `npm ci` and `npm run build` in a Node stage so images always include fresh static assets.
 
 ```bash
 npm --prefix frontend install
@@ -118,18 +129,25 @@ curl -H "x-api-token: $APP_API_TOKEN" "http://127.0.0.1:8400/api/runs/<run_id>/s
 - `pytest -q`
 
 ## Deployment
-- `Dockerfile`
-- `docker-compose.yml`
+- **Image:** multi-stage `Dockerfile` (Node builds [frontend/](frontend) → `app/ui/static`, then Python install). Non-root runtime via `gosu` in [scripts/docker-entrypoint.sh](scripts/docker-entrypoint.sh); `HEALTHCHECK` uses `/api/health/live`.
+- **Dev:** [docker-compose.yml](docker-compose.yml) — bind-mount + `--reload`; overrides entrypoint so your host tree is not `chown`ed.
+- **Prod-style:** [docker-compose.prod.yml](docker-compose.prod.yml) — named volume `/data` for SQLite + workspaces, no reload, `restart: unless-stopped`. Set `SOURCE_REPO_PATH` (see compose comments) when using repository-backed runs.
+- **CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (ruff, mypy, pytest). **GHCR:** push a `v*` tag to build and publish the image ([`.github/workflows/docker.yml`](.github/workflows/docker.yml)).
+- **Runbook / scaling:** [docs/RUNBOOK.md](docs/RUNBOOK.md), [docs/DEPLOYMENT_SCALING.md](docs/DEPLOYMENT_SCALING.md).
 - `.env.example`
 
 ## Docs
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
+- [docs/OPERATIONAL_READINESS.md](docs/OPERATIONAL_READINESS.md)
 - [docs/MASTER_BUILD_SPEC.md](docs/MASTER_BUILD_SPEC.md)
 - [docs/RUNBOOK.md](docs/RUNBOOK.md)
+- [docs/DEPLOYMENT_SCALING.md](docs/DEPLOYMENT_SCALING.md)
 - [docs/API.md](docs/API.md)
 - [docs/SPEC_IMPLEMENTATION_MATRIX.md](docs/SPEC_IMPLEMENTATION_MATRIX.md)
 
 ## Limitations
-- Orchestration currently runs on a single in-process worker queue.
+- Orchestration uses a shared in-process queue with `WORKER_COUNT` parallel workers; SQLite serializes writes — prefer Postgres (`DB_URL`) for many concurrent runs with heavy artifact writes. See [docs/DEPLOYMENT_SCALING.md](docs/DEPLOYMENT_SCALING.md).
 - Provider adapter surface is LM Studio-first; additional backends are not yet implemented.
 - Test coverage is strongest in API-level unit tests; deeper multi-process E2E remains limited.
 

@@ -27,6 +27,9 @@ class TaskModel(Base):
     target_files_json: Mapped[str] = mapped_column(Text, default="[]")
     provider_override: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     model_override: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    source_repo_spec: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    use_scout: Mapped[bool] = mapped_column(Boolean, default=False)
+    stage_models_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     runs: Mapped[list["RunModel"]] = relationship(back_populates="task")
@@ -112,6 +115,49 @@ class RunStateSnapshotModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     run: Mapped[RunModel] = relationship(back_populates="state_snapshots")
+
+
+class RepoLessonModel(Base):
+    """Cross-run factual snippets for planner context (per repo_key scope)."""
+
+    __tablename__ = "repo_lessons"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    repo_key: Mapped[str] = mapped_column(String(64), index=True)
+    body: Mapped[str] = mapped_column(Text)
+    source_run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class RolePlaybookModel(Base):
+    """Per-role supervised playbook overlay (Part J)."""
+
+    __tablename__ = "role_playbooks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    repo_key: Mapped[str] = mapped_column(String(64), index=True)
+    role: Mapped[str] = mapped_column(String(64), index=True)
+    content: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    proposed_by_run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    supervisor_decision: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    supervisor_rationale: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    supervisor_merged_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    supervisor_model_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    supervisor_run_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    human_decision: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    human_actor: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    human_acted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    human_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 def _decode_json_list(raw_value: str) -> list[str]:

@@ -27,6 +27,19 @@ class Settings(BaseSettings):
         default="qwen2.5-coder-14b-instruct",
         alias="LMSTUDIO_MODEL",
     )
+    lmstudio_model_planner: Optional[str] = Field(default=None, alias="LMSTUDIO_MODEL_PLANNER")
+    lmstudio_model_architect: Optional[str] = Field(default=None, alias="LMSTUDIO_MODEL_ARCHITECT")
+    lmstudio_model_ui_designer: Optional[str] = Field(
+        default=None,
+        alias="LMSTUDIO_MODEL_UI_DESIGNER",
+    )
+    lmstudio_model_coder: Optional[str] = Field(default=None, alias="LMSTUDIO_MODEL_CODER")
+    lmstudio_model_reviewer: Optional[str] = Field(default=None, alias="LMSTUDIO_MODEL_REVIEWER")
+    lmstudio_model_tester: Optional[str] = Field(default=None, alias="LMSTUDIO_MODEL_TESTER")
+    lmstudio_model_supervisor: Optional[str] = Field(
+        default=None,
+        alias="LMSTUDIO_MODEL_SUPERVISOR",
+    )
     lmstudio_api_key: str = Field(default="lm-studio", alias="LMSTUDIO_API_KEY")
     provider_timeout_seconds: float = Field(default=60.0, alias="PROVIDER_TIMEOUT_SECONDS")
     planner_stage_timeout_seconds: float = Field(
@@ -37,6 +50,9 @@ class Settings(BaseSettings):
 
     workspace_root: str = Field(default="./workspace", alias="WORKSPACE_ROOT")
     source_repo_path: Optional[str] = Field(default=None, alias="SOURCE_REPO_PATH")
+    allowed_git_hosts: str = Field(default="", alias="ALLOWED_GIT_HOSTS")
+    allowed_source_repo_roots: str = Field(default="", alias="ALLOWED_SOURCE_REPO_ROOTS")
+    git_clone_timeout_seconds: float = Field(default=300.0, alias="GIT_CLONE_TIMEOUT_SECONDS")
     backup_root: str = Field(default="./backups", alias="BACKUP_ROOT")
     encryption_key: str = Field(default="change-me", alias="APP_ENCRYPTION_KEY")
     git_author_name: str = Field(default="AI Dev Platform", alias="GIT_AUTHOR_NAME")
@@ -48,6 +64,19 @@ class Settings(BaseSettings):
     worker_count: int = Field(default=1, alias="WORKER_COUNT")
     artifact_char_limit: int = Field(default=12000, alias="ARTIFACT_CHAR_LIMIT")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    use_scout_stage: bool = Field(default=False, alias="USE_SCOUT_STAGE")
+    playbook_supervisor_enabled: bool = Field(default=False, alias="PLAYBOOK_SUPERVISOR_ENABLED")
+    playbook_require_human_confirm: bool = Field(
+        default=True,
+        alias="PLAYBOOK_REQUIRE_HUMAN_CONFIRM",
+    )
+    playbook_supervisor_system_prompt_path: str = Field(
+        default="app/agents/prompts/playbook_supervisor.md",
+        alias="PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH",
+    )
+    playbook_char_limit: int = Field(default=8000, alias="PLAYBOOK_CHAR_LIMIT")
+    repo_lesson_max_lines: int = Field(default=40, alias="REPO_LESSON_MAX_LINES")
 
     @property
     def workspace_root_path(self) -> Path:

@@ -1,8 +1,12 @@
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.core.exceptions import ConfigurationError
+from app.core.settings import get_settings
+from app.services.source_repo_policy import validate_source_repo_spec
 
 
 class TaskCreate(BaseModel):
@@ -15,6 +19,44 @@ class TaskCreate(BaseModel):
     provider: Optional[str] = None
     model: Optional[str] = None
     request_text: Optional[str] = Field(default=None, min_length=10)
+    source_repo: Optional[str] = None
+    use_scout: bool = False
+    stage_models: Optional[dict[str, str]] = None
+
+    @field_validator("source_repo")
+    @classmethod
+    def validate_source_repo(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        spec = str(value).strip()
+        try:
+            validate_source_repo_spec(spec, get_settings())
+        except ConfigurationError as exc:
+            raise ValueError(str(exc)) from exc
+        return spec
+
+    @field_validator("stage_models")
+    @classmethod
+    def validate_stage_models(cls, value: Optional[dict[str, Any]]) -> Optional[dict[str, str]]:
+        if not value:
+            return None
+        allowed = {
+            "planner",
+            "architect",
+            "ui_designer",
+            "coder",
+            "reviewer",
+            "tester",
+            "supervisor",
+        }
+        out: dict[str, str] = {}
+        for key, raw in value.items():
+            k = str(key).strip().lower()
+            if k not in allowed:
+                raise ValueError(f"Unknown stage_models key: {key!r}.")
+            if isinstance(raw, str) and raw.strip():
+                out[k] = raw.strip()
+        return out or None
 
     @model_validator(mode="after")
     def validate_request_fields(self) -> "TaskCreate":
@@ -34,6 +76,8 @@ class TaskCreate(BaseModel):
             lines.extend(["Description:", self.request_text])
         if self.workspace_path:
             lines.append(f"Workspace path: {self.workspace_path}")
+        if self.source_repo:
+            lines.append(f"Source repository: {self.source_repo}")
         if self.task_type:
             lines.append(f"Task type: {self.task_type}")
         if self.constraints:

@@ -1,8 +1,11 @@
 
+import sqlite3
 from collections.abc import Generator
 from functools import lru_cache
+from typing import cast
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import Table, create_engine, event, inspect, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.settings import get_settings
@@ -12,9 +15,23 @@ class Base(DeclarativeBase):
     pass
 
 
+@event.listens_for(Engine, "connect")
+def _configure_sqlite_connection(dbapi_connection, connection_record) -> None:
+    if not isinstance(dbapi_connection, sqlite3.Connection):
+        return
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.close()
+
+
 @lru_cache(maxsize=4)
 def _get_engine(db_url: str):
-    connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
+    connect_args: dict = {}
+    if db_url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+        connect_args["timeout"] = 30.0
     return create_engine(db_url, connect_args=connect_args, future=True)
 
 
@@ -42,6 +59,8 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     from app.db.models import (  # noqa: F401
         ArtifactModel,
+        RepoLessonModel,
+        RolePlaybookModel,
         RunEventModel,
         RunModel,
         RunStateSnapshotModel,
@@ -50,6 +69,8 @@ def init_db() -> None:
 
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
+    cast(Table, RepoLessonModel.__table__).create(bind=engine, checkfirst=True)
+    cast(Table, RolePlaybookModel.__table__).create(bind=engine, checkfirst=True)
     _apply_lightweight_migrations(engine)
 
 
@@ -67,6 +88,9 @@ def _apply_lightweight_migrations(engine) -> None:
         "target_files_json": "TEXT DEFAULT '[]' NOT NULL",
         "provider_override": "VARCHAR(128)",
         "model_override": "VARCHAR(255)",
+        "source_repo_spec": "TEXT",
+        "use_scout": "INTEGER DEFAULT 0 NOT NULL",
+        "stage_models_json": "TEXT DEFAULT '{}' NOT NULL",
     }
     run_additions = {
         "request_id": "VARCHAR(64)",

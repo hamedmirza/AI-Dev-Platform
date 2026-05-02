@@ -62,3 +62,11 @@ class RunActionResponse(BaseModel):
     run_id: str
     status: str
     message: str
+
+
+class RunHistoryCleanupResponse(BaseModel):
+    deleted_runs: int
+    deleted_tasks: int
+    cleaned_workspaces: int
+    kept_terminal_runs: int
+    message: str

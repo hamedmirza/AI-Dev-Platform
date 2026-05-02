@@ -6,7 +6,11 @@ from app.api.routes.config import require_api_token
 from app.core.exceptions import WorkflowError
 from app.db.session import get_db
 from app.schemas.diff import DiffResponse
-from app.schemas.run import RunActionRequest, RunActionResponse
+from app.schemas.run import (
+    RunActionRequest,
+    RunActionResponse,
+    RunHistoryCleanupResponse,
+)
 from app.schemas.workspace import (
     WorkspaceFileResponse,
     WorkspaceFilesResponse,
@@ -25,6 +29,7 @@ from app.services.run_service import (
     abort_run,
     approve_run,
     cleanup_workspace,
+    clear_terminal_run_history,
     get_run,
     get_run_history,
     get_run_state_snapshots,
@@ -42,6 +47,23 @@ def fetch_runs(
     session: Session = Depends(get_db),
 ):
     return list_runs(session, limit=limit)
+
+
+@router.post(
+    "/runs/clear-terminal-history",
+    dependencies=[Depends(require_api_token)],
+    response_model=RunHistoryCleanupResponse,
+)
+def clear_terminal_history(
+    keep_latest: int = Query(default=4, ge=0, le=50),
+    cleanup_workspaces: bool = Query(default=True),
+    session: Session = Depends(get_db),
+):
+    return clear_terminal_run_history(
+        session,
+        keep_latest=keep_latest,
+        cleanup_workspaces=cleanup_workspaces,
+    )
 
 
 @router.get("/runs/{run_id}", dependencies=[Depends(require_api_token)])

@@ -1,0 +1,48 @@
+# VCS / IDE
+.git
+.gitignore
+.cursor
+.github
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+ENV
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+*.egg-info
+.eggs
+dist
+build
+wheels
+
+# Node (host copies; image builds its own)
+node_modules
+frontend/node_modules
+
+# Secrets and local env (never send to build context)
+.env
+.env.*
+!.env.example
+
+# Local databases and runtime data
+*.db
+workspace
+!workspace/.gitkeep
+backups
+!backups/.gitkeep
+
+# Plans / misc
+*.plan.md
+.cursor/plans
+
+# Tests (not shipped in production image; keeps build context small)
+tests

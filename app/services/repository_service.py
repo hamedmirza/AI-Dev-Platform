@@ -1,6 +1,6 @@
 import shutil
 from pathlib import Path
-from typing import Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 from app.core.exceptions import ConfigurationError
 from app.core.settings import get_settings
@@ -14,6 +14,7 @@ from app.tools.filesystem import (
 from app.tools.git_tools import (
     checkout_new_branch,
     clone_local_repository,
+    clone_remote_repository,
     commit_all_changes,
     current_branch,
     current_head_sha,
@@ -23,6 +24,9 @@ from app.tools.git_tools import (
 )
 from app.tools.workspace_guard import ensure_within_root
 
+if TYPE_CHECKING:
+    from app.db.models import TaskModel
+
 
 def get_repository_summary() -> dict[str, object]:
     repo_path = require_source_repo()
@@ -31,10 +35,30 @@ def get_repository_summary() -> dict[str, object]:
     return summary
 
 
-def create_run_workspace(run_id: str) -> Path:
-    repo_path = require_source_repo()
+def create_run_workspace(run_id: str, task: Optional["TaskModel"] = None) -> Path:
+    from app.services.source_repo_policy import validate_source_repo_spec
+
+    settings = get_settings()
     workspace_path = prepare_workspace_directory(run_id)
-    clone_local_repository(repo_path, workspace_path)
+    spec = (task.source_repo_spec.strip() if task and task.source_repo_spec else "") or ""
+
+    if spec:
+        resolved = validate_source_repo_spec(spec, settings)
+        if resolved.kind == "local" and resolved.local_path is not None:
+            clone_local_repository(resolved.local_path, workspace_path)
+        elif resolved.kind == "remote" and resolved.remote_url is not None:
+            clone_remote_repository(
+                resolved.remote_url,
+                workspace_path,
+                timeout_seconds=settings.git_clone_timeout_seconds,
+                depth=1,
+            )
+        else:
+            raise ConfigurationError("Invalid resolved source repository.")
+    else:
+        repo_path = require_source_repo()
+        clone_local_repository(repo_path, workspace_path)
+
     checkout_new_branch(workspace_path, f"run/{run_id}")
     return workspace_path
 

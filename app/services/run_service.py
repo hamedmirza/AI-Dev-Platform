@@ -3,14 +3,15 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.enums import RunStage, RunStatus
 from app.core.exceptions import WorkflowError
-from app.db.models import RunEventModel, RunModel, RunStateSnapshotModel
+from app.db.models import RunEventModel, RunModel, RunStateSnapshotModel, TaskModel
 from app.schemas.run import (
     RunEventResponse,
+    RunHistoryCleanupResponse,
     RunResponse,
     RunStateSnapshotResponse,
     TaskSummaryResponse,
@@ -178,6 +179,58 @@ def retry_run(session: Session, run_id: str, note: Optional[str] = None) -> RunR
 
 def cleanup_workspace(run_id: str) -> dict[str, object]:
     return cleanup_run_workspace(run_id)
+
+
+def clear_terminal_run_history(
+    session: Session,
+    *,
+    keep_latest: int = 4,
+    cleanup_workspaces: bool = True,
+) -> RunHistoryCleanupResponse:
+    terminal_statuses = [
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.BLOCKED,
+        RunStatus.CANCELLED,
+    ]
+    keep_count = max(0, min(keep_latest, 50))
+    terminal_runs = session.scalars(
+        select(RunModel)
+        .where(RunModel.status.in_(terminal_statuses))
+        .order_by(RunModel.updated_at.desc(), RunModel.created_at.desc())
+    ).all()
+    kept_runs = terminal_runs[:keep_count]
+    runs_to_delete = terminal_runs[keep_count:]
+    cleaned_workspaces = 0
+
+    for run in runs_to_delete:
+        if cleanup_workspaces:
+            cleanup_result = cleanup_run_workspace(run.id)
+            if bool(cleanup_result.get("removed")):
+                cleaned_workspaces += 1
+        session.delete(run)
+
+    deleted_runs = len(runs_to_delete)
+    session.flush()
+
+    orphan_tasks = session.scalars(
+        select(TaskModel).where(~exists().where(RunModel.task_id == TaskModel.id))
+    ).all()
+    for task in orphan_tasks:
+        session.delete(task)
+
+    deleted_tasks = len(orphan_tasks)
+    session.commit()
+    return RunHistoryCleanupResponse(
+        deleted_runs=deleted_runs,
+        deleted_tasks=deleted_tasks,
+        cleaned_workspaces=cleaned_workspaces,
+        kept_terminal_runs=len(kept_runs),
+        message=(
+            f"Cleared {deleted_runs} terminal runs and kept the latest "
+            f"{len(kept_runs)} terminal records."
+        ),
+    )
 
 
 def _to_snapshot_response(

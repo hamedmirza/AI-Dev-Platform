@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 
 from app.core.settings import get_settings
 from app.services.github_service import get_github_status
+from app.services.lmstudio_models_service import fetch_lmstudio_models
 from app.services.repository_service import get_repository_config_snapshot
 
 router = APIRouter(tags=["config"])
@@ -39,15 +40,38 @@ def config_summary() -> dict[str, object]:
             "app_port": settings.app_port,
             "lmstudio_base_url": settings.lmstudio_base_url,
             "lmstudio_model": settings.lmstudio_model,
+            "lmstudio_model_planner": settings.lmstudio_model_planner or "",
+            "lmstudio_model_architect": settings.lmstudio_model_architect or "",
+            "lmstudio_model_ui_designer": settings.lmstudio_model_ui_designer or "",
+            "lmstudio_model_coder": settings.lmstudio_model_coder or "",
+            "lmstudio_model_reviewer": settings.lmstudio_model_reviewer or "",
+            "lmstudio_model_tester": settings.lmstudio_model_tester or "",
+            "lmstudio_model_supervisor": settings.lmstudio_model_supervisor or "",
             "lmstudio_api_key": settings.lmstudio_api_key,
             "provider_timeout_seconds": settings.provider_timeout_seconds,
+            "allowed_git_hosts": settings.allowed_git_hosts,
+            "allowed_source_repo_roots": settings.allowed_source_repo_roots,
+            "git_clone_timeout_seconds": settings.git_clone_timeout_seconds,
             "source_repo_path": str(settings.source_repo_path_resolved or ""),
             "workspace_root": str(settings.workspace_root_path),
             "backup_root": str(settings.backup_root_path),
             "git_author_name": settings.git_author_name,
             "git_author_email": settings.git_author_email,
             "log_level": settings.log_level,
+            "use_scout_stage": settings.use_scout_stage,
+            "playbook_supervisor_enabled": settings.playbook_supervisor_enabled,
+            "playbook_require_human_confirm": settings.playbook_require_human_confirm,
+            "playbook_supervisor_system_prompt_path": (
+                settings.playbook_supervisor_system_prompt_path
+            ),
         },
         "repository": get_repository_config_snapshot(),
         "github": get_github_status(),
     }
+
+
+@router.get("/config/lmstudio/models", dependencies=[Depends(require_api_token)])
+def lmstudio_models_list() -> dict[str, object]:
+    settings = get_settings()
+    models, err = fetch_lmstudio_models(settings)
+    return {"models": models, "error": err}

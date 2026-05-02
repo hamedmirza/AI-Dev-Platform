@@ -10,6 +10,8 @@ from fastapi.staticfiles import StaticFiles
 from app.api.routes.backups import router as backups_router
 from app.api.routes.config import router as config_router
 from app.api.routes.health import router as health_router
+from app.api.routes.lessons import router as lessons_router
+from app.api.routes.playbooks import router as playbooks_router
 from app.api.routes.runs import router as runs_router
 from app.api.routes.tasks import router as tasks_router
 from app.core.logging import configure_logging
@@ -58,6 +60,8 @@ def create_app() -> FastAPI:
     app.include_router(health_router, prefix="/api")
     app.include_router(backups_router, prefix="/api")
     app.include_router(config_router, prefix="/api")
+    app.include_router(playbooks_router, prefix="/api")
+    app.include_router(lessons_router, prefix="/api")
     app.include_router(tasks_router, prefix="/api")
     app.include_router(runs_router, prefix="/api")
     app.include_router(ui_router)

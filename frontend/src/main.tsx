@@ -101,6 +101,14 @@ type WorkspaceFile = {
   content: string;
 };
 
+type RunHistoryCleanupResponse = {
+  deleted_runs: number;
+  deleted_tasks: number;
+  cleaned_workspaces: number;
+  kept_terminal_runs: number;
+  message: string;
+};
+
 type BackupItem = {
   name: string;
   path: string;
@@ -398,6 +406,20 @@ function LoadingPanel() {
 
 function Dashboard({ data, onNotice, onError }: { data: AppData; onNotice: (message: string) => void; onError: (message: string) => void }) {
   const lanes = useMemo(() => groupRuns(data.runs), [data.runs]);
+  const activeCount = lanes.Active.length + lanes.Review.length;
+  const issueCount = lanes.Blocked.length;
+  const clearTerminalHistory = async () => {
+    try {
+      const result = await api<RunHistoryCleanupResponse>(
+        "/api/runs/clear-terminal-history?keep_latest=4&cleanup_workspaces=true",
+        { method: "POST", body: "{}" }
+      );
+      onNotice(result.message);
+      window.location.reload();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Run history cleanup failed.");
+    }
+  };
   return (
     <div className="stack">
       <section className="health-grid">
@@ -429,7 +451,13 @@ function Dashboard({ data, onNotice, onError }: { data: AppData; onNotice: (mess
             <p className="eyebrow">Run board</p>
             <h2>Agent task kanban</h2>
           </div>
-          <Boxes size={20} />
+          <div className="panel-actions">
+            <span className="status ok">{activeCount} active</span>
+            <span className={`status ${issueCount ? "bad" : "ok"}`}>{issueCount} issues</span>
+            <button className="ghost compact" type="button" onClick={clearTerminalHistory}>
+              <Archive size={16} /> Clear terminal history
+            </button>
+          </div>
         </div>
         <div className="kanban">
           {Object.entries(lanes).map(([lane, runs]) => (
@@ -438,6 +466,7 @@ function Dashboard({ data, onNotice, onError }: { data: AppData; onNotice: (mess
                 <span>{lane}</span>
                 <strong>{runs.length}</strong>
               </div>
+              {runs.length === 0 && <div className="lane-empty">No runs</div>}
               {runs.map((item) => <RunCard run={item} key={item.id} />)}
             </div>
           ))}
@@ -478,6 +507,16 @@ function TaskComposer({ onNotice, onError }: { onNotice: (message: string) => vo
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     try {
+      const stageModelsRaw = String(form.get("stage_models_json") || "").trim();
+      let stage_models: Record<string, string> | null = null;
+      if (stageModelsRaw) {
+        try {
+          const parsed = JSON.parse(stageModelsRaw) as Record<string, string>;
+          stage_models = typeof parsed === "object" && parsed !== null ? parsed : null;
+        } catch {
+          throw new Error("stage_models_json must be valid JSON object, e.g. {\"coder\":\"my-model-id\"}");
+        }
+      }
       const created = await api<{ run_id: string }>("/api/tasks", {
         method: "POST",
         body: JSON.stringify({
@@ -488,7 +527,10 @@ function TaskComposer({ onNotice, onError }: { onNotice: (message: string) => vo
           target_files: splitCsv(String(form.get("target_files") || "")),
           constraints: splitCsv(String(form.get("constraints") || "")),
           provider: String(form.get("provider") || "") || null,
-          model: String(form.get("model") || "") || null
+          model: String(form.get("model") || "") || null,
+          source_repo: String(form.get("source_repo") || "") || null,
+          use_scout: form.get("use_scout") === "on",
+          stage_models
         })
       });
       onNotice(`Task created: ${created.run_id}`);
@@ -516,6 +558,11 @@ function TaskComposer({ onNotice, onError }: { onNotice: (message: string) => vo
           <input name="provider" placeholder="Provider" />
         </div>
         <input name="model" placeholder="Model override" />
+        <input name="source_repo" placeholder="Source repo path or URL (optional; requires ALLOWED_GIT_HOSTS for remotes)" />
+        <label className="muted" style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          <input type="checkbox" name="use_scout" /> Use read-only scout preamble for planner
+        </label>
+        <textarea name="stage_models_json" placeholder='Optional per-stage models JSON, e.g. {"coder":"model-id"}' rows={2} />
         <input name="target_files" placeholder="Target files, comma-separated" />
         <input name="constraints" placeholder="Constraints, comma-separated" />
         <textarea name="request_text" placeholder="Describe the implementation task." required />
@@ -604,6 +651,24 @@ function ProviderView({ data }: { data: AppData }) {
 
 function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; onNotice: (message: string) => void; onError: (message: string) => void }) {
   const runtime = config?.runtime || {};
+  const [modelIds, setModelIds] = useState<string[]>([]);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+
+  const refreshModels = async () => {
+    try {
+      const payload = await api<{ models: { id: string }[]; error: string | null }>("/api/config/lmstudio/models");
+      setModelsError(payload.error);
+      setModelIds((payload.models || []).map((m) => m.id).filter(Boolean));
+    } catch (err) {
+      setModelsError(err instanceof Error ? err.message : "Failed to load models");
+      setModelIds([]);
+    }
+  };
+
+  useEffect(() => {
+    void refreshModels();
+  }, [String(runtime.lmstudio_base_url), String(runtime.lmstudio_api_key)]);
+
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -627,19 +692,45 @@ function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; o
         <Settings size={22} />
       </div>
       <form className="settings-grid" onSubmit={submit}>
+        <datalist id="lmstudio-model-ids">
+          {modelIds.map((id) => (
+            <option value={id} key={id} />
+          ))}
+        </datalist>
+        {modelsError ? <p className="muted">Model list: {modelsError}</p> : null}
+        <div className="two-col">
+          <button className="ghost compact" type="button" onClick={() => void refreshModels()}>
+            <RefreshCw size={16} /> Refresh LM Studio models
+          </button>
+        </div>
         <input name="APP_HOST" defaultValue={String(runtime.app_host || "0.0.0.0")} placeholder="APP_HOST" />
         <input name="APP_PORT" defaultValue={String(runtime.app_port || "8400")} placeholder="APP_PORT" />
         <input name="APP_API_TOKEN" type="hidden" value="__UNCHANGED__" readOnly />
+        <input name="WORKER_COUNT" defaultValue={String(config?.worker_count ?? 1)} placeholder="WORKER_COUNT" />
         <input name="LMSTUDIO_BASE_URL" defaultValue={String(runtime.lmstudio_base_url || "")} placeholder="LMSTUDIO_BASE_URL" />
-        <input name="LMSTUDIO_MODEL" defaultValue={String(runtime.lmstudio_model || "")} placeholder="LMSTUDIO_MODEL" />
+        <input name="LMSTUDIO_MODEL" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model || "")} placeholder="LMSTUDIO_MODEL" />
+        <input name="LMSTUDIO_MODEL_PLANNER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_planner || "")} placeholder="LMSTUDIO_MODEL_PLANNER" />
+        <input name="LMSTUDIO_MODEL_ARCHITECT" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_architect || "")} placeholder="LMSTUDIO_MODEL_ARCHITECT" />
+        <input name="LMSTUDIO_MODEL_UI_DESIGNER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_ui_designer || "")} placeholder="LMSTUDIO_MODEL_UI_DESIGNER" />
+        <input name="LMSTUDIO_MODEL_CODER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_coder || "")} placeholder="LMSTUDIO_MODEL_CODER" />
+        <input name="LMSTUDIO_MODEL_REVIEWER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_reviewer || "")} placeholder="LMSTUDIO_MODEL_REVIEWER" />
+        <input name="LMSTUDIO_MODEL_TESTER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_tester || "")} placeholder="LMSTUDIO_MODEL_TESTER" />
+        <input name="LMSTUDIO_MODEL_SUPERVISOR" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_supervisor || "")} placeholder="LMSTUDIO_MODEL_SUPERVISOR" />
         <input name="LMSTUDIO_API_KEY" defaultValue={String(runtime.lmstudio_api_key || "")} placeholder="LMSTUDIO_API_KEY" />
         <input name="PROVIDER_TIMEOUT_SECONDS" defaultValue={String(runtime.provider_timeout_seconds || "60")} placeholder="PROVIDER_TIMEOUT_SECONDS" />
+        <input name="GIT_CLONE_TIMEOUT_SECONDS" defaultValue={String(runtime.git_clone_timeout_seconds || "300")} placeholder="GIT_CLONE_TIMEOUT_SECONDS" />
         <input name="SOURCE_REPO_PATH" defaultValue={String(runtime.source_repo_path || "")} placeholder="SOURCE_REPO_PATH" />
+        <input name="ALLOWED_GIT_HOSTS" defaultValue={String(runtime.allowed_git_hosts || "")} placeholder="ALLOWED_GIT_HOSTS" />
+        <input name="ALLOWED_SOURCE_REPO_ROOTS" defaultValue={String(runtime.allowed_source_repo_roots || "")} placeholder="ALLOWED_SOURCE_REPO_ROOTS" />
         <input name="WORKSPACE_ROOT" defaultValue={String(runtime.workspace_root || "")} placeholder="WORKSPACE_ROOT" />
         <input name="BACKUP_ROOT" defaultValue={String(runtime.backup_root || "")} placeholder="BACKUP_ROOT" />
         <input name="GIT_AUTHOR_NAME" defaultValue={String(runtime.git_author_name || "")} placeholder="GIT_AUTHOR_NAME" />
         <input name="GIT_AUTHOR_EMAIL" defaultValue={String(runtime.git_author_email || "")} placeholder="GIT_AUTHOR_EMAIL" />
         <input name="LOG_LEVEL" defaultValue={String(runtime.log_level || "INFO")} placeholder="LOG_LEVEL" />
+        <input name="USE_SCOUT_STAGE" defaultValue={String(runtime.use_scout_stage ?? "false")} placeholder="USE_SCOUT_STAGE" />
+        <input name="PLAYBOOK_SUPERVISOR_ENABLED" defaultValue={String(runtime.playbook_supervisor_enabled ?? "false")} placeholder="PLAYBOOK_SUPERVISOR_ENABLED" />
+        <input name="PLAYBOOK_REQUIRE_HUMAN_CONFIRM" defaultValue={String(runtime.playbook_require_human_confirm ?? "true")} placeholder="PLAYBOOK_REQUIRE_HUMAN_CONFIRM" />
+        <input name="PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH" defaultValue={String(runtime.playbook_supervisor_system_prompt_path || "app/agents/prompts/playbook_supervisor.md")} placeholder="PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH" />
         <button type="submit"><Save size={16} /> Save Settings</button>
       </form>
     </section>

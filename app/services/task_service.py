@@ -11,6 +11,7 @@ from app.schemas.task import TaskCreate, TaskCreated
 
 def create_task_and_run(session: Session, payload: TaskCreate, provider_name: str) -> TaskCreated:
     request_id = get_request_id()
+    stage_models_json = json.dumps(payload.stage_models or {}, sort_keys=True)
     task = TaskModel(
         title=payload.title,
         request_text=payload.to_prompt_text(),
@@ -21,6 +22,9 @@ def create_task_and_run(session: Session, payload: TaskCreate, provider_name: st
         target_files_json=json.dumps(payload.target_files),
         provider_override=payload.provider,
         model_override=payload.model,
+        source_repo_spec=payload.source_repo,
+        use_scout=payload.use_scout,
+        stage_models_json=stage_models_json,
     )
     session.add(task)
     session.flush()

@@ -1,8 +1,16 @@
 
+import os
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 from app.core.exceptions import ConfigurationError
+
+
+def _git_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    return env
 
 
 def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -12,7 +20,33 @@ def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         capture_output=True,
         check=False,
+        env=_git_subprocess_env(),
     )
+
+
+def clone_remote_repository(
+    url: str,
+    workspace_path: Path,
+    *,
+    timeout_seconds: float,
+    depth: Optional[int] = 1,
+) -> None:
+    """Clone a remote URL into an existing empty workspace directory (git clone url .)."""
+    args = ["git", "clone", "--quiet"]
+    if depth is not None and depth > 0:
+        args.extend(["--depth", str(int(depth))])
+    args.extend([url, "."])
+    result = subprocess.run(
+        args,
+        cwd=str(workspace_path),
+        text=True,
+        capture_output=True,
+        check=False,
+        env=_git_subprocess_env(),
+        timeout=timeout_seconds,
+    )
+    if result.returncode != 0:
+        raise ConfigurationError(result.stderr.strip() or "Failed to clone remote repository.")
 
 
 def validate_git_repository(repo_path: Path) -> dict[str, object]:
