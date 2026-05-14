@@ -1,5 +1,6 @@
 import json
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -108,6 +109,54 @@ class SlowPlannerProvider(FakeProvider):
     def invoke_json(self, system_prompt: str, user_prompt: str) -> str:
         time.sleep(0.2)
         return super().invoke_json(system_prompt, user_prompt)
+
+
+class VerySlowPlannerProvider(FakeProvider):
+    def invoke_json(self, system_prompt: str, user_prompt: str) -> str:
+        prompt = f"{system_prompt}\n{user_prompt}".lower()
+        if "summary, assumptions, risks, steps" in prompt:
+            time.sleep(1.0)
+        return super().invoke_json(system_prompt, user_prompt)
+
+
+class ConcurrentIsolationProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self.active_calls = 0
+        self.max_concurrency = 0
+
+    def invoke_json(self, system_prompt: str, user_prompt: str) -> str:
+        with self._lock:
+            self.active_calls += 1
+            if self.active_calls > self.max_concurrency:
+                self.max_concurrency = self.active_calls
+        try:
+            time.sleep(0.05)
+            prompt = f"{system_prompt}\n{user_prompt}".lower()
+            if "changed_files" in prompt:
+                marker = "generic"
+                if "alpha-marker" in prompt:
+                    marker = "alpha"
+                elif "beta-marker" in prompt:
+                    marker = "beta"
+                payload = {
+                    "changed_files": ["README.md"],
+                    "implementation_notes": [f"Apply workspace marker {marker}."],
+                    "requires_operator_approval": True,
+                    "file_changes": [
+                        {
+                            "path": "README.md",
+                            "content": f"fixture repo\nupdated by {marker}\n",
+                            "change_type": "upsert",
+                        }
+                    ],
+                }
+                return json.dumps(payload)
+            return super().invoke_json(system_prompt, user_prompt)
+        finally:
+            with self._lock:
+                self.active_calls -= 1
 
 
 class MalformedCoderProvider(FakeProvider):
@@ -367,12 +416,13 @@ def wait_for_run_status(
 
 def test_health_live_and_ready(tmp_path: Path, monkeypatch) -> None:
     client = build_client(tmp_path, monkeypatch)
+    headers = {"x-api-token": "test-token"}
     with client:
         live = client.get("/api/health/live")
         assert live.status_code == 200
         assert live.json() == {"status": "live"}
 
-        ready = client.get("/api/health/ready")
+        ready = client.get("/api/health/ready", headers=headers)
         assert ready.status_code == 200
         body = ready.json()
         assert body["status"] == "ready"
@@ -454,17 +504,22 @@ def test_clear_terminal_history_preserves_active_runs(tmp_path: Path, monkeypatc
         assert kept_run_id in run_ids
         assert len(run_ids) == 2
 
-        provider = client.get("/api/health/provider")
+        provider = client.get("/api/health/provider", headers=headers)
         assert provider.status_code == 200
         assert provider.json()["status"] == "healthy"
 
-        repository = client.get("/api/health/repository")
+        repository = client.get("/api/health/repository", headers=headers)
         assert repository.status_code == 200
         assert repository.json()["path"].endswith("source-repo")
 
-        github = client.get("/api/health/github")
+        github = client.get("/api/health/github", headers=headers)
         assert github.status_code == 200
-        assert github.json()["configured"] is False
+        gh = github.json()
+        assert gh["configured"] is False
+        assert gh.get("repo_full_name") == "hamedmirza/AI-Dev-Platform"
+        assert gh.get("repo_html_url") == "https://github.com/hamedmirza/AI-Dev-Platform"
+        assert gh.get("repo_clone_url") == "https://github.com/hamedmirza/AI-Dev-Platform.git"
+        assert gh.get("repo_default_branch") == "main"
 
 
 def test_task_run_reaches_awaiting_approval(tmp_path: Path, monkeypatch) -> None:
@@ -1207,6 +1262,8 @@ def test_ui_login_dashboard_and_run_detail(tmp_path: Path, monkeypatch) -> None:
                 "GIT_AUTHOR_NAME": "Test User",
                 "GIT_AUTHOR_EMAIL": "test@example.com",
                 "LOG_LEVEL": "INFO",
+                "GITHUB_REPO_FULL_NAME": "hamedmirza/AI-Dev-Platform",
+                "GITHUB_REPO_DEFAULT_BRANCH": "main",
             },
             follow_redirects=False,
         )
@@ -1370,3 +1427,236 @@ def test_planner_timeout_retries_then_fails(tmp_path: Path, monkeypatch) -> None
         assert event_types.count("planner_timeout") >= 1
         assert "planner_retry" in event_types
         assert "planner_failed" in event_types
+
+
+def test_running_run_can_be_cancelled_at_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    client = build_client(tmp_path, monkeypatch, provider=VerySlowPlannerProvider())
+    headers = {"x-api-token": "test-token"}
+
+    with client:
+        response = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "title": "Cancel while planner is running",
+                "request_text": "Start a run and cancel it during planner stage.",
+            },
+        )
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+
+        status = wait_for_run_status(
+            client,
+            run_id,
+            headers,
+            {"running", "awaiting_approval", "failed"},
+        )
+        assert status == "running"
+
+        abort = client.post(f"/api/runs/{run_id}/abort", headers=headers, json={"note": None})
+        assert abort.status_code == 200
+        assert abort.json()["status"] == "cancelled"
+
+        cancelled = wait_for_run_status(client, run_id, headers, {"cancelled"})
+        assert cancelled == "cancelled"
+
+        history = client.get(f"/api/runs/{run_id}/history", headers=headers)
+        assert history.status_code == 200
+        event_types = [item["event_type"] for item in history.json()]
+        assert "operator_cancel_requested" in event_types
+        saw_checkpoint = "run_cancelled_checkpoint" in event_types
+        deadline = time.time() + 2.0
+        while not saw_checkpoint and time.time() < deadline:
+            time.sleep(0.05)
+            refreshed = client.get(f"/api/runs/{run_id}/history", headers=headers)
+            assert refreshed.status_code == 200
+            refreshed_types = [item["event_type"] for item in refreshed.json()]
+            saw_checkpoint = "run_cancelled_checkpoint" in refreshed_types
+        assert saw_checkpoint
+
+
+def test_worker_count_two_runs_concurrent_isolation(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("WORKER_COUNT", "2")
+    provider = ConcurrentIsolationProvider()
+    client = build_client(tmp_path, monkeypatch, provider=provider)
+    headers = {"x-api-token": "test-token"}
+
+    with client:
+        run_ids: list[str] = []
+        for name, marker in [("Alpha run", "alpha-marker"), ("Beta run", "beta-marker")]:
+            response = client.post(
+                "/api/tasks",
+                headers=headers,
+                json={
+                    "title": name,
+                    "request_text": f"Concurrent isolation check for {marker}.",
+                },
+            )
+            assert response.status_code == 200
+            run_ids.append(response.json()["run_id"])
+
+        for run_id in run_ids:
+            status = wait_for_run_status(
+                client,
+                run_id,
+                headers,
+                {"awaiting_approval", "failed", "blocked"},
+            )
+            assert status == "awaiting_approval"
+
+        assert provider.max_concurrency >= 2
+
+        alpha_file = client.get(
+            f"/api/runs/{run_ids[0]}/workspace/file?path=README.md",
+            headers=headers,
+        )
+        beta_file = client.get(
+            f"/api/runs/{run_ids[1]}/workspace/file?path=README.md",
+            headers=headers,
+        )
+        assert alpha_file.status_code == 200
+        assert beta_file.status_code == 200
+        assert "updated by alpha" in alpha_file.json()["content"]
+        assert "updated by beta" in beta_file.json()["content"]
+
+
+def test_project_chat_intake_plan_and_start_build(tmp_path: Path, monkeypatch) -> None:
+    client = build_client(tmp_path, monkeypatch)
+    headers = {"x-api-token": "test-token"}
+
+    with client:
+        created = client.post(
+            "/api/projects",
+            headers=headers,
+            json={
+                "name": "Clinic CRM",
+                "initial_requirements": "Build a small CRM for clinics with patient follow-up.",
+                "validation_profile": "full-stack",
+            },
+        )
+        assert created.status_code == 200
+        project = created.json()
+        project_id = project["id"]
+        assert project["status"] == "intake"
+        assert project["readiness_score"] == 0
+        assert len([q for q in project["questions"] if q["status"] == "open"]) == 7
+
+        for question in project["questions"]:
+            answered = client.post(
+                f"/api/projects/{project_id}/questions/{question['id']}/answer",
+                headers=headers,
+                json={"answer": f"{question['key']} answer"},
+            )
+            assert answered.status_code == 200
+
+        planned = client.post(
+            f"/api/projects/{project_id}/messages",
+            headers=headers,
+            json={"content": "create plan"},
+        )
+        assert planned.status_code == 200
+        planned_project = planned.json()["project"]
+        assert planned_project["readiness_score"] == 100
+        assert planned_project["status"] == "ready_for_approval"
+        assert len(planned_project["build_items_detail"]) == 4
+
+        approved = client.post(
+            f"/api/projects/{project_id}/plan/approve",
+            headers=headers,
+        )
+        assert approved.status_code == 200
+        assert all(item["status"] == "approved" for item in approved.json()["build_items_detail"])
+
+        started = client.post(
+            f"/api/projects/{project_id}/start-build",
+            headers=headers,
+        )
+        assert started.status_code == 200
+        body = started.json()
+        assert body["run_id"]
+        assert len(body["run_ids"]) == 3
+        assert body["run_id"] == body["run_ids"][0]
+        assert body["project"]["status"] == "building"
+        linked_items = [
+            item
+            for item in body["project"]["build_items_detail"]
+            if item["run_id"] in body["run_ids"]
+        ]
+        assert len(linked_items) == 3
+        assert {item["title"] for item in linked_items} == {
+            "Product and architecture baseline",
+            "Backend foundation",
+            "Frontend operator experience",
+        }
+        validation_item = next(
+            item
+            for item in body["project"]["build_items_detail"]
+            if item["title"] == "Release validation"
+        )
+        assert validation_item["run_id"] is None
+        assert validation_item["depends_on"] == [
+            "Product and architecture baseline",
+            "Backend foundation",
+            "Frontend operator experience",
+        ]
+
+        session = get_session_factory()()
+        try:
+            for run_id in body["run_ids"]:
+                run = session.get(RunModel, run_id)
+                assert run is not None
+                run.status = RunStatus.COMPLETED
+            session.commit()
+        finally:
+            session.close()
+
+        validation_started = client.post(
+            f"/api/projects/{project_id}/start-build",
+            headers=headers,
+        )
+        assert validation_started.status_code == 200
+        validation_body = validation_started.json()
+        assert len(validation_body["run_ids"]) == 1
+        validation_item = next(
+            item
+            for item in validation_body["project"]["build_items_detail"]
+            if item["title"] == "Release validation"
+        )
+        assert validation_item["run_id"] == validation_body["run_id"]
+
+
+def test_saved_source_repo_can_be_loaded_into_project(tmp_path: Path, monkeypatch) -> None:
+    client = build_client(tmp_path, monkeypatch)
+    headers = {"x-api-token": "test-token"}
+    source_repo = tmp_path / "source-repo"
+
+    with client:
+        saved = client.post(
+            "/api/source-repos",
+            headers=headers,
+            json={"label": "Fixture source", "source_repo": str(source_repo)},
+        )
+        assert saved.status_code == 200
+        saved_body = saved.json()
+        assert saved_body["label"] == "Fixture source"
+        assert saved_body["source_repo_spec"] == str(source_repo)
+        assert saved_body["kind"] == "local"
+        assert saved_body["valid"] is True
+        assert saved_body["branch"] == "main"
+
+        listed = client.get("/api/source-repos", headers=headers)
+        assert listed.status_code == 200
+        assert [item["source_repo_spec"] for item in listed.json()] == [str(source_repo)]
+
+        created = client.post(
+            "/api/projects",
+            headers=headers,
+            json={
+                "name": "Loaded Repo Project",
+                "initial_requirements": "Work on the saved local repository.",
+                "source_repo": saved_body["source_repo_spec"],
+            },
+        )
+        assert created.status_code == 200
+        project = created.json()
+        assert project["source_repo_spec"] == str(source_repo)

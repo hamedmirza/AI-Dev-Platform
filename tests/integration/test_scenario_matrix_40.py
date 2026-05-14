@@ -109,7 +109,7 @@ def s02_health(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 def s03_health_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Rationale: readiness must include database connectivity."""
     with build_client(tmp_path, monkeypatch) as c:
-        r = c.get("/api/health/ready")
+        r = c.get("/api/health/ready", headers=HDR)
         assert r.status_code == 200
         body = r.json()
         assert body.get("status") == "ready"
@@ -119,7 +119,7 @@ def s03_health_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 def s04_health_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Rationale: provider adapter must report healthy under fake provider."""
     with build_client(tmp_path, monkeypatch) as c:
-        r = c.get("/api/health/provider")
+        r = c.get("/api/health/provider", headers=HDR)
         assert r.status_code == 200
         assert r.json().get("status") == "healthy"
 
@@ -127,7 +127,7 @@ def s04_health_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 def s05_health_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Rationale: configured git source repo path is exposed for operators."""
     with build_client(tmp_path, monkeypatch) as c:
-        r = c.get("/api/health/repository")
+        r = c.get("/api/health/repository", headers=HDR)
         assert r.status_code == 200
         assert "source-repo" in r.json().get("path", "")
 
@@ -135,9 +135,12 @@ def s05_health_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
 def s06_health_github(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Rationale: GitHub integration status is explicit when unset."""
     with build_client(tmp_path, monkeypatch) as c:
-        r = c.get("/api/health/github")
+        r = c.get("/api/health/github", headers=HDR)
         assert r.status_code == 200
-        assert r.json().get("configured") is False
+        body = r.json()
+        assert body.get("configured") is False
+        assert body.get("repo_full_name") == "hamedmirza/AI-Dev-Platform"
+        assert "github.com/hamedmirza/AI-Dev-Platform" in str(body.get("repo_html_url", ""))
 
 
 def s07_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -146,7 +149,10 @@ def s07_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         r = c.get("/api/config", headers=HDR)
         assert r.status_code == 200
         assert "runtime" in r.json()
-        assert r.json()["runtime"].get("app_port") == 8400
+        rt = r.json()["runtime"]
+        assert rt.get("app_port") == 8400
+        assert rt.get("github_repo_full_name") == "hamedmirza/AI-Dev-Platform"
+        assert str(rt.get("github_repo_clone_url", "")).endswith("AI-Dev-Platform.git")
 
 
 def s08_runs_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

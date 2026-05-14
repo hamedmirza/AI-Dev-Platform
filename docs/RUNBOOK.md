@@ -12,9 +12,7 @@
 - For strict external checks (for example only route traffic when the model is up), combine **readiness** with your own probe of `/api/health/provider`.
 
 ## Validation
-- `ruff check app tests`
-- `mypy app`
-- `pytest -q`
+- `bash scripts/run_checks.sh` (ruff + mypy + pytest + frontend typecheck/build)
 
 ## Backup
 - Use `/ui/backups` to create a local backup.
