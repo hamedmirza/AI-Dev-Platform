@@ -1,10 +1,11 @@
 
+from secrets import compare_digest
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 
 from app.core.settings import get_settings
-from app.services.github_service import get_github_status
+from app.services.github_service import get_github_status, github_repo_metadata
 from app.services.lmstudio_models_service import fetch_lmstudio_models
 from app.services.repository_service import get_repository_config_snapshot
 
@@ -17,7 +18,9 @@ def require_api_token(
 ) -> None:
     settings = get_settings()
     cookie_token = request.cookies.get("operator_token")
-    if x_api_token != settings.app_api_token and cookie_token != settings.app_api_token:
+    header_ok = x_api_token is not None and compare_digest(x_api_token, settings.app_api_token)
+    cookie_ok = cookie_token is not None and compare_digest(cookie_token, settings.app_api_token)
+    if not header_ok and not cookie_ok:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid API token.",
@@ -27,6 +30,7 @@ def require_api_token(
 @router.get("/config", dependencies=[Depends(require_api_token)])
 def config_summary() -> dict[str, object]:
     settings = get_settings()
+    gh_repo = github_repo_metadata(settings)
     return {
         "app_env": settings.app_env,
         "model_provider": settings.model_provider,
@@ -47,8 +51,10 @@ def config_summary() -> dict[str, object]:
             "lmstudio_model_reviewer": settings.lmstudio_model_reviewer or "",
             "lmstudio_model_tester": settings.lmstudio_model_tester or "",
             "lmstudio_model_supervisor": settings.lmstudio_model_supervisor or "",
-            "lmstudio_api_key": settings.lmstudio_api_key,
+            "lmstudio_api_key_configured": bool(settings.lmstudio_api_key.strip()),
             "provider_timeout_seconds": settings.provider_timeout_seconds,
+            "planner_stage_timeout_seconds": settings.planner_stage_timeout_seconds,
+            "planner_stage_max_retries": settings.planner_stage_max_retries,
             "allowed_git_hosts": settings.allowed_git_hosts,
             "allowed_source_repo_roots": settings.allowed_source_repo_roots,
             "git_clone_timeout_seconds": settings.git_clone_timeout_seconds,
@@ -64,6 +70,10 @@ def config_summary() -> dict[str, object]:
             "playbook_supervisor_system_prompt_path": (
                 settings.playbook_supervisor_system_prompt_path
             ),
+            "github_repo_full_name": gh_repo["repo_full_name"],
+            "github_repo_default_branch": gh_repo["repo_default_branch"],
+            "github_repo_html_url": gh_repo["repo_html_url"],
+            "github_repo_clone_url": gh_repo["repo_clone_url"],
         },
         "repository": get_repository_config_snapshot(),
         "github": get_github_status(),

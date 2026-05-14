@@ -6,8 +6,6 @@ from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import WorkflowError
 from app.core.settings import get_settings
@@ -52,6 +50,11 @@ def _require_authorized(request: Request):
     if not _authorized(request):
         return RedirectResponse("/ui/login", status_code=303)
     return None
+
+
+def _should_secure_cookie(request: Request) -> bool:
+    settings = get_settings()
+    return request.url.scheme == "https" or settings.app_env.lower() == "production"
 
 
 def _nav() -> str:
@@ -335,105 +338,21 @@ def ui_root(request: Request):
         return redirect
     return HTMLResponse(react_app_shell("Operator Console"))
 
-    session = get_session_factory()()
-    try:
-        runs = session.scalars(
-            select(RunModel)
-            .options(selectinload(RunModel.task))
-            .order_by(RunModel.created_at.desc())
-            .limit(12),
-        ).all()
-    finally:
-        session.close()
 
-    provider = get_provider_health()
-    repository = get_repository_summary()
-    github = get_github_status()
-    backups = sorted(get_settings().backup_root_path.glob("backup-*"), reverse=True)
-    github_state = "configured" if bool(github["configured"]) else "missing"
-    repo_path = escape(str(repository["path"]))
-    repo_head = escape(str(repository["head_sha"]))
-    repo_dirty = escape(str(repository["dirty"]))
-    repo_branch = escape(str(repository["branch"]))
+@router.get("/ui/projects", response_class=HTMLResponse)
+def ui_projects(request: Request):
+    redirect = _require_authorized(request)
+    if redirect:
+        return redirect
+    return HTMLResponse(react_app_shell("Projects"))
 
-    page_error = request.query_params.get("error")
-    page_success = request.query_params.get("success")
-    created_run_id = request.query_params.get("created_run_id")
-    error_html = (
-        f'<section class="panel"><div class="meta" style="color:#9f3a2d;">{escape(page_error)}</div></section>'
-        if page_error
-        else ""
-    )
-    success_html = (
-        f'<section class="panel"><div class="meta" style="color:#2d6a3a;">{escape(page_success)}</div></section>'
-        if page_success
-        else ""
-    )
-    body = f"""
-    {error_html}
-    {success_html}
-    <section class="panel hero">
-      <div class="eyebrow">Operator Overview</div>
-      <h2>Local operations console for planning, run control, and recovery.</h2>
-      <p>
-        The platform is now usable as a local-first backend with approval gates, workspace cloning,
-        backup rehearsal, and a real run timeline. GitHub remains optional until you wire a token.
-      </p>
-      <div class="metrics">
-        <div class="metric">Provider<strong>{status_badge(provider.status.value)}</strong></div>
-        <div class="metric">Repository<strong>{repo_branch}</strong></div>
-        <div class="metric">GitHub<strong>{status_badge(github_state)}</strong></div>
-        <div class="metric">Backups<strong>{len(backups)}</strong></div>
-      </div>
-    </section>
-    <div class="wide-grid">
-      <section class="panel">
-        <div class="section-head">
-          <h2>New Task</h2>
-        </div>
-        <form method="post" action="/ui/tasks">
-          <input type="text" name="title" placeholder="Run title" required>
-          <input type="text" name="workspace_path" placeholder="Workspace path (optional)">
-          <input type="text" name="task_type" placeholder="Task type (optional)">
-          <input type="text" name="target_files" placeholder="Target files, comma-separated">
-          <input type="text" name="constraints" placeholder="Constraints, comma-separated">
-          <input type="text" name="provider" placeholder="Provider override (optional)">
-          <input type="text" name="model" placeholder="Model override (optional)">
-          <textarea
-            name="request_text"
-            placeholder="Describe the software task in detail."
-            required
-          ></textarea>
-          <button type="submit">Start Run</button>
-        </form>
-      </section>
-      <section class="panel">
-        <div class="section-head">
-          <h2>Repository Snapshot</h2>
-          <a href="/ui/repository">Open repository view</a>
-        </div>
-        <div class="list">
-          {_item("Path", repo_path)}
-          {_item("Head", repo_head)}
-          {_item("Dirty", repo_dirty)}
-        </div>
-      </section>
-    </div>
-    <section class="panel">
-      <div class="section-head">
-        <h2>Recent Runs</h2>
-      </div>
-      <div class="list">{_render_runs(runs, highlighted_run_id=created_run_id)}</div>
-    </section>
-    """
-    html = layout(
-        "Operator Console",
-        "Local-first run control for the AI Dev Platform.",
-        _nav(),
-        body,
-        _sidebar("dashboard"),
-    )
-    return HTMLResponse(page("Operator Console", html))
+
+@router.get("/ui/projects/{project_id}", response_class=HTMLResponse)
+def ui_project_detail(request: Request, project_id: str):
+    redirect = _require_authorized(request)
+    if redirect:
+        return redirect
+    return HTMLResponse(react_app_shell(f"Project {project_id}"))
 
 
 @router.get("/ui/repository", response_class=HTMLResponse)
@@ -589,7 +508,7 @@ def settings_submit(
     APP_HOST: str = Form(...),
     APP_PORT: str = Form(...),
     APP_API_TOKEN: str = Form(...),
-    WORKER_COUNT: str = Form("1"),
+    WORKER_COUNT: str = Form("3"),
     LMSTUDIO_BASE_URL: str = Form(...),
     LMSTUDIO_MODEL: str = Form(...),
     LMSTUDIO_MODEL_PLANNER: str = Form(""),
@@ -616,12 +535,18 @@ def settings_submit(
     PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH: str = Form(
         "app/agents/prompts/playbook_supervisor.md",
     ),
+    GITHUB_REPO_FULL_NAME: str = Form(default="hamedmirza/AI-Dev-Platform"),
+    GITHUB_REPO_DEFAULT_BRANCH: str = Form(default="main"),
 ):
     redirect = _require_authorized(request)
     if redirect:
         return redirect
     current_token = get_settings().app_api_token
+    current_lmstudio_key = get_settings().lmstudio_api_key
     next_token = current_token if APP_API_TOKEN == "__UNCHANGED__" else APP_API_TOKEN
+    next_lmstudio_key = (
+        current_lmstudio_key if LMSTUDIO_API_KEY == "__UNCHANGED__" else LMSTUDIO_API_KEY
+    )
 
     save_local_settings(
         {
@@ -638,7 +563,7 @@ def settings_submit(
             "LMSTUDIO_MODEL_REVIEWER": LMSTUDIO_MODEL_REVIEWER,
             "LMSTUDIO_MODEL_TESTER": LMSTUDIO_MODEL_TESTER,
             "LMSTUDIO_MODEL_SUPERVISOR": LMSTUDIO_MODEL_SUPERVISOR,
-            "LMSTUDIO_API_KEY": LMSTUDIO_API_KEY,
+            "LMSTUDIO_API_KEY": next_lmstudio_key,
             "PROVIDER_TIMEOUT_SECONDS": PROVIDER_TIMEOUT_SECONDS,
             "GIT_CLONE_TIMEOUT_SECONDS": GIT_CLONE_TIMEOUT_SECONDS,
             "SOURCE_REPO_PATH": SOURCE_REPO_PATH,
@@ -653,11 +578,19 @@ def settings_submit(
             "PLAYBOOK_SUPERVISOR_ENABLED": PLAYBOOK_SUPERVISOR_ENABLED,
             "PLAYBOOK_REQUIRE_HUMAN_CONFIRM": PLAYBOOK_REQUIRE_HUMAN_CONFIRM,
             "PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH": PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH,
+            "GITHUB_REPO_FULL_NAME": GITHUB_REPO_FULL_NAME,
+            "GITHUB_REPO_DEFAULT_BRANCH": GITHUB_REPO_DEFAULT_BRANCH,
         }
     )
     response = RedirectResponse("/ui/settings?success=Settings+saved.", status_code=303)
     if next_token != request.cookies.get("operator_token"):
-        response.set_cookie("operator_token", next_token, httponly=True, samesite="lax")
+        response.set_cookie(
+            "operator_token",
+            next_token,
+            httponly=True,
+            samesite="lax",
+            secure=_should_secure_cookie(request),
+        )
     return response
 
 
@@ -696,9 +629,15 @@ def login_page():
 
 
 @router.post("/ui/login")
-def login_submit(token: str = Form(...)):
+def login_submit(request: Request, token: str = Form(...)):
     response = RedirectResponse("/ui", status_code=303)
-    response.set_cookie("operator_token", token, httponly=True, samesite="lax")
+    response.set_cookie(
+        "operator_token",
+        token,
+        httponly=True,
+        samesite="lax",
+        secure=_should_secure_cookie(request),
+    )
     return response
 
 

@@ -14,6 +14,25 @@ from app.schemas.provider import ProviderHealthResponse
 logger = logging.getLogger(__name__)
 
 
+def _lmstudio_response_detail(response: httpx.Response) -> str:
+    """Best-effort extract LM Studio / OpenAI-style error text for operators."""
+    try:
+        data = response.json()
+    except ValueError:
+        text = (response.text or "").strip()
+        return text[:800] if text else "(empty body)"
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        if isinstance(err, str):
+            return err
+        msg = data.get("message")
+        if msg:
+            return str(msg)
+    return str(data)[:800]
+
+
 class LMStudioProvider(BaseProvider):
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -35,14 +54,9 @@ class LMStudioProvider(BaseProvider):
             raise ProviderError(f"Unsupported provider override: {provider_name}")
         if not model_name:
             return self
-        new_provider = LMStudioProvider(
+        return LMStudioProvider(
             self.settings.model_copy(update={"lmstudio_model": model_name})
         )
-        try:
-            self._client.close()
-        except Exception:
-            pass
-        return new_provider
 
     def invoke_json(self, system_prompt: str, user_prompt: str) -> str:
         return self.structured_completion(system_prompt, user_prompt)
@@ -51,9 +65,13 @@ class LMStudioProvider(BaseProvider):
         return self.structured_completion(system_prompt, user_prompt)
 
     def structured_completion(self, system_prompt: str, user_prompt: str) -> str:
+        model = (self.settings.lmstudio_model or "").strip()
+        if not model:
+            raise ProviderError("LM Studio model is not configured (LMSTUDIO_MODEL is empty).")
+
         url = f"{self.settings.lmstudio_base_url.rstrip('/')}/chat/completions"
         payload_with_json = {
-            "model": self.settings.lmstudio_model,
+            "model": model,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -61,7 +79,7 @@ class LMStudioProvider(BaseProvider):
             ],
         }
         payload_fallback = {
-            "model": self.settings.lmstudio_model,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {
@@ -77,12 +95,28 @@ class LMStudioProvider(BaseProvider):
         try:
             response = self._client.post(url, headers=self._headers(), json=payload_with_json)
             if response.status_code == 400:
+                detail = _lmstudio_response_detail(response)
                 logger.warning(
-                    "lmstudio response_format rejected; "
+                    "lmstudio response_format rejected (400); detail=%s; "
                     "retrying without response_format model=%s",
-                    self.settings.lmstudio_model,
+                    detail,
+                    model,
                 )
                 response = self._client.post(url, headers=self._headers(), json=payload_fallback)
+            if response.is_client_error or response.is_server_error:
+                detail = _lmstudio_response_detail(response)
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                logger.warning(
+                    "lmstudio chat/completions error status=%s latency_ms=%.2f model=%s detail=%s",
+                    response.status_code,
+                    elapsed_ms,
+                    model,
+                    detail,
+                )
+                raise ProviderError(
+                    f"LM Studio request failed: {response.status_code} "
+                    f"{response.reason_phrase} — {detail}"
+                )
             response.raise_for_status()
         except httpx.HTTPError as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000
@@ -98,7 +132,7 @@ class LMStudioProvider(BaseProvider):
         logger.info(
             "lmstudio structured_completion ok latency_ms=%.2f model=%s",
             elapsed_ms,
-            self.settings.lmstudio_model,
+            model,
         )
         try:
             return data["choices"][0]["message"]["content"]
@@ -120,7 +154,8 @@ class LMStudioProvider(BaseProvider):
             elapsed_ms = (time.perf_counter() - started) * 1000
             logger.info("lmstudio health_check ok latency_ms=%.2f", elapsed_ms)
             available = {item.get("id") for item in data.get("data", []) if isinstance(item, dict)}
-            if self.settings.lmstudio_model in available:
+            configured = (self.settings.lmstudio_model or "").strip()
+            if configured in available:
                 return ProviderHealthResponse(
                     provider="lmstudio",
                     status=ProviderStatus.HEALTHY,

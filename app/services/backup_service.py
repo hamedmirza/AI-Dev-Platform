@@ -1,5 +1,6 @@
 import json
 import shutil
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -26,7 +27,7 @@ def create_backup() -> BackupResponse:
 
     db_path = _sqlite_file_path()
     copied_db = target_dir / db_path.name
-    shutil.copy2(db_path, copied_db)
+    _backup_sqlite_database(db_path, copied_db)
 
     manifest = {
         "db_url": settings.db_url,
@@ -45,6 +46,22 @@ def create_backup() -> BackupResponse:
         database_included=True,
         settings_included=True,
     )
+
+
+def _backup_sqlite_database(source_db: Path, target_db: Path) -> None:
+    """Create a consistent SQLite backup even while writes are active."""
+    settings = get_settings()
+    if settings.db_url.startswith("sqlite:///"):
+        # Use sqlite online backup API against the live DB.
+        src = sqlite3.connect(str(source_db), timeout=30)
+        dst = sqlite3.connect(str(target_db), timeout=30)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        return
+    shutil.copy2(source_db, target_db)
 
 
 def rehearse_restore(manifest_path: Path) -> RestoreRehearsalResponse:

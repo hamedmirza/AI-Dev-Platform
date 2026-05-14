@@ -19,7 +19,7 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 
 from app.core.enums import ArtifactType, ProviderStatus, RunStage, RunStatus, StringEnum
-from app.core.exceptions import ConfigurationError, ProviderError
+from app.core.exceptions import ConfigurationError, ProviderError, WorkflowError
 from app.core.request_context import set_request_id, set_run_id
 from app.core.settings import get_settings
 from app.db.models import ArtifactModel, RunEventModel, RunModel, RunStateSnapshotModel, TaskModel
@@ -257,6 +257,8 @@ class OrchestrationService:
             run = session.get(RunModel, run_id)
             if run is None:
                 return
+            if run.status == RunStatus.CANCELLED:
+                return
             set_run_id(run.id)
             set_request_id(run.request_id)
 
@@ -297,6 +299,9 @@ class OrchestrationService:
             )
             session.commit()
 
+            if self._checkpoint_cancelled(session, run, "workspace_prepared"):
+                return
+
             planner_stage = self._stage_by_name(RunStage.PLANNER)
             architect_stage = self._stage_by_name(RunStage.ARCHITECT)
             ui_designer_stage = self._stage_by_name(RunStage.UI_DESIGNER)
@@ -320,6 +325,8 @@ class OrchestrationService:
             )
             if planner_model is None:
                 return
+            if self._checkpoint_cancelled(session, run, "planner_completed"):
+                return
             workflow_state["planner_output"] = planner_model.model_dump_json()
             architect_model = cast(
                 ArchitectureResponse,
@@ -331,6 +338,8 @@ class OrchestrationService:
                     task.request_text,
                 ),
             )
+            if self._checkpoint_cancelled(session, run, "architect_completed"):
+                return
             workflow_state["architecture_output"] = architect_model.model_dump_json()
             ui_design_model = cast(
                 UIDesignResponse,
@@ -342,6 +351,8 @@ class OrchestrationService:
                     task.request_text,
                 ),
             )
+            if self._checkpoint_cancelled(session, run, "ui_designer_completed"):
+                return
             workflow_state["ui_design_output"] = ui_design_model.model_dump_json()
 
             review_retries = 0
@@ -350,6 +361,8 @@ class OrchestrationService:
             retry_feedback: list[str] = []
 
             while True:
+                if self._checkpoint_cancelled(session, run, "coder_loop_checkpoint"):
+                    return
                 coder_prompt = self._build_coder_request(
                     task.request_text,
                     run.id,
@@ -405,6 +418,8 @@ class OrchestrationService:
                     run.status = RunStatus.RUNNING
                     continue
                 workflow_state["code_output"] = code_model.model_dump_json()
+                if self._checkpoint_cancelled(session, run, "code_model_generated"):
+                    return
                 try:
                     self._apply_code_changes(session, run, code_model)
                 except PatchGuardError as exc:
@@ -456,6 +471,8 @@ class OrchestrationService:
                         review_prompt,
                     ),
                 )
+                if self._checkpoint_cancelled(session, run, "review_completed"):
+                    return
                 workflow_state["review_output"] = review_model.model_dump_json()
                 if not review_model.approved:
                     review_retries += 1
@@ -511,6 +528,8 @@ class OrchestrationService:
                     run,
                     test_model,
                 )
+                if self._checkpoint_cancelled(session, run, "tester_completed"):
+                    return
                 workflow_state["test_output"] = test_model.model_dump_json()
                 if not test_model.passed or not local_validation_passed:
                     test_retries += 1
@@ -673,6 +692,8 @@ class OrchestrationService:
         current_request = request_text
         stage_name = stage.stage.value
         for attempt in range(1, attempts + 1):
+            if self._checkpoint_cancelled(session, run, f"{stage_name}_retry_checkpoint"):
+                raise WorkflowError("Run cancelled by operator.")
             try:
                 return self._run_stage(session, run, task, stage, current_request)
             except (ProviderError, ValidationError) as exc:
@@ -702,6 +723,28 @@ class OrchestrationService:
                 )
 
         raise ProviderError(f"{stage_name} stage failed to return valid structured output.")
+
+    def _checkpoint_cancelled(self, session, run: RunModel, step: str) -> bool:
+        session.refresh(run)
+        if run.status != RunStatus.CANCELLED:
+            return False
+        if not run.error_message:
+            run.error_message = "Run cancelled by operator."
+        self._add_event(
+            session,
+            run.id,
+            "run_cancelled_checkpoint",
+            f"Cancellation checkpoint reached at {step}.",
+        )
+        self._record_state_snapshot(
+            session,
+            run,
+            self._build_state_for_stage(run, run.current_stage),
+            current_step="cancelled",
+            payload={"checkpoint": step},
+        )
+        session.commit()
+        return True
 
     def _is_retryable_stage_output_error(self, exc: Exception) -> bool:
         if isinstance(exc, ValidationError):

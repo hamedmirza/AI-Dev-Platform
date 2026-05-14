@@ -145,12 +145,26 @@ def abort_run(session: Session, run_id: str, note: Optional[str] = None) -> RunR
     run = session.get(RunModel, run_id)
     if run is None:
         raise WorkflowError("Run not found.")
-    if run.status == RunStatus.RUNNING:
-        raise WorkflowError("Cannot abort a currently running run.")
+    if run.status in {
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.BLOCKED,
+    }:
+        raise WorkflowError("Run is already in a terminal state.")
 
     run.status = RunStatus.CANCELLED
-    run.error_message = note or "Run cancelled by operator."
-    _record_event(session, run, "operator_cancelled", run.error_message)
+    if run.error_message is None:
+        run.error_message = note or "Run cancelled by operator."
+    if run.current_stage and str(run.current_stage) == str(RunStage.INTAKE):
+        _record_event(session, run, "operator_cancelled", run.error_message)
+    else:
+        _record_event(
+            session,
+            run,
+            "operator_cancel_requested",
+            note or "Operator requested cancellation. Worker will stop at next checkpoint.",
+        )
     _record_action_snapshot(session, run, "operator_cancelled")
     session.commit()
     result = get_run(session, run_id)

@@ -3,7 +3,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     workspace_root: str = Field(default="./workspace", alias="WORKSPACE_ROOT")
     source_repo_path: Optional[str] = Field(default=None, alias="SOURCE_REPO_PATH")
     allowed_git_hosts: str = Field(default="", alias="ALLOWED_GIT_HOSTS")
+    # Canonical GitHub repo for this platform (owner/repo, shown in settings / health).
+    github_repo_full_name: str = Field(
+        default="hamedmirza/AI-Dev-Platform",
+        alias="GITHUB_REPO_FULL_NAME",
+    )
+    github_repo_default_branch: str = Field(default="main", alias="GITHUB_REPO_DEFAULT_BRANCH")
     allowed_source_repo_roots: str = Field(default="", alias="ALLOWED_SOURCE_REPO_ROOTS")
     git_clone_timeout_seconds: float = Field(default=300.0, alias="GIT_CLONE_TIMEOUT_SECONDS")
     backup_root: str = Field(default="./backups", alias="BACKUP_ROOT")
@@ -61,7 +67,7 @@ class Settings(BaseSettings):
         alias="GIT_AUTHOR_EMAIL",
     )
 
-    worker_count: int = Field(default=1, alias="WORKER_COUNT")
+    worker_count: int = Field(default=3, alias="WORKER_COUNT")
     artifact_char_limit: int = Field(default=12000, alias="ARTIFACT_CHAR_LIMIT")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
@@ -77,6 +83,29 @@ class Settings(BaseSettings):
     )
     playbook_char_limit: int = Field(default=8000, alias="PLAYBOOK_CHAR_LIMIT")
     repo_lesson_max_lines: int = Field(default=40, alias="REPO_LESSON_MAX_LINES")
+
+    @field_validator("github_repo_full_name", mode="before")
+    @classmethod
+    def normalize_github_repo_full_name(cls, value: object) -> str:
+        if value is None:
+            return ""
+        s = str(value).strip()
+        for prefix in ("https://github.com/", "http://github.com/"):
+            if s.lower().startswith(prefix):
+                s = s[len(prefix) :]
+        if s.lower().startswith("github.com/"):
+            s = s.split("/", 1)[1] if "/" in s else ""
+        if s.endswith(".git"):
+            s = s[:-4]
+        return s.strip().strip("/")
+
+    @field_validator("github_repo_default_branch", mode="before")
+    @classmethod
+    def normalize_default_branch(cls, value: object) -> str:
+        if value is None:
+            return "main"
+        b = str(value).strip()
+        return b if b else "main"
 
     @property
     def workspace_root_path(self) -> Path:

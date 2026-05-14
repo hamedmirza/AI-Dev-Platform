@@ -1,6 +1,7 @@
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.api.routes.config import require_api_token
 from app.db.session import get_engine
 from app.providers.health import get_provider_health
 from app.services.github_service import get_github_status
@@ -15,7 +16,7 @@ def health_live() -> dict[str, str]:
     return {"status": "live"}
 
 
-@router.get("/health/ready")
+@router.get("/health/ready", dependencies=[Depends(require_api_token)])
 def health_ready() -> dict[str, object]:
     """Readiness: database reachable; provider status is informational (soft check)."""
     try:
@@ -40,16 +41,16 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/health/provider")
+@router.get("/health/provider", dependencies=[Depends(require_api_token)])
 def provider_health():
     return get_provider_health()
 
 
-@router.get("/health/repository")
+@router.get("/health/repository", dependencies=[Depends(require_api_token)])
 def repository_health():
     return get_repository_summary()
 
 
-@router.get("/health/github")
+@router.get("/health/github", dependencies=[Depends(require_api_token)])
 def github_health():
     return get_github_status()
