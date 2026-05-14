@@ -8,21 +8,28 @@ import {
   ChevronRight,
   CircleDot,
   Code2,
+  Copy,
   Database,
   FileText,
+  FolderKanban,
   GitBranch,
+  HelpCircle,
   History,
   LayoutDashboard,
+  MessageSquare,
   Loader2,
   Play,
   RefreshCw,
   RotateCcw,
   Save,
+  Send,
   Settings,
   Shield,
   Square,
   X
 } from "lucide-react";
+import { TaskComposer } from "./components/TaskComposer";
+import { api, postForm } from "./http";
 import "./styles.css";
 
 type TaskSummary = {
@@ -137,6 +144,11 @@ type RepositoryHealth = {
 type GithubHealth = {
   configured: boolean;
   detail: string;
+  login?: string;
+  repo_full_name?: string;
+  repo_html_url?: string;
+  repo_clone_url?: string;
+  repo_default_branch?: string;
 };
 
 type ConfigSummary = {
@@ -157,6 +169,96 @@ type AppData = {
   config?: ConfigSummary;
   runs: RunSummary[];
   backups: BackupItem[];
+  projects: ProjectSummary[];
+  sourceRepos: SavedSourceRepo[];
+};
+
+type ProjectSummary = {
+  id: string;
+  name: string;
+  slug: string;
+  status: string;
+  app_type: string | null;
+  source_repo_spec: string | null;
+  validation_profile: string;
+  readiness_score: number;
+  open_questions: number;
+  build_items: number;
+  active_runs: number;
+  created_at: string;
+  updated_at: string;
+};
+
+type ProjectMessage = {
+  id: number;
+  project_id: string;
+  role: string;
+  message_type: string;
+  content: string;
+  structured_json: string;
+  created_at: string;
+};
+
+type ProjectQuestion = {
+  id: number;
+  project_id: string;
+  key: string;
+  question: string;
+  reason: string;
+  answer_type: string;
+  options: string[];
+  status: string;
+  answer: string | null;
+  created_at: string;
+  answered_at: string | null;
+};
+
+type ProjectBuildItem = {
+  id: number;
+  project_id: string;
+  parent_id: number | null;
+  title: string;
+  description: string;
+  item_type: string;
+  status: string;
+  target_files: string[];
+  depends_on: string[];
+  assigned_role: string;
+  run_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type ProjectDetail = ProjectSummary & {
+  initial_requirements: string;
+  target_stack: Record<string, string>;
+  messages: ProjectMessage[];
+  questions: ProjectQuestion[];
+  build_items_detail: ProjectBuildItem[];
+};
+
+type ProjectCommandResponse = {
+  project: ProjectDetail;
+  message: string;
+  action: string;
+  run_id: string | null;
+  run_ids: string[];
+};
+
+type SavedSourceRepo = {
+  id: string;
+  label: string;
+  source_repo_spec: string;
+  kind: string;
+  valid: boolean;
+  repo_key: string;
+  status: string;
+  branch: string | null;
+  head_sha: string | null;
+  remotes: string[];
+  dirty: boolean | null;
+  created_at: string;
+  updated_at: string;
 };
 
 /** Matches `RunStage` in the API (approval, not awaiting_approval). */
@@ -206,6 +308,7 @@ function shortRunId(id: string): string {
 
 const nav = [
   { key: "dashboard", label: "Dashboard", href: "/ui", icon: LayoutDashboard },
+  { key: "projects", label: "Projects", href: "/ui/projects", icon: FolderKanban },
   { key: "runs", label: "Runs", href: "/ui#runs", icon: Boxes },
   { key: "repository", label: "Repository", href: "/ui/repository", icon: GitBranch },
   { key: "provider", label: "Provider", href: "/ui/provider", icon: Activity },
@@ -213,36 +316,10 @@ const nav = [
   { key: "backups", label: "Backups", href: "/ui/backups", icon: Archive }
 ];
 
-function api<T>(path: string, init?: RequestInit): Promise<T> {
-  return fetch(path, {
-    credentials: "same-origin",
-    headers: {
-      "content-type": "application/json",
-      ...(init?.headers || {})
-    },
-    ...init
-  }).then(async (response) => {
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(detail || `${response.status} ${response.statusText}`);
-    }
-    return response.json() as Promise<T>;
-  });
-}
-
-function postForm(path: string, fields: Record<string, string>): Promise<Response> {
-  const form = new FormData();
-  Object.entries(fields).forEach(([key, value]) => form.append(key, value));
-  return fetch(path, {
-    method: "POST",
-    credentials: "same-origin",
-    body: form,
-    redirect: "manual"
-  });
-}
-
 function currentView() {
   const path = window.location.pathname;
+  if ((path === "/ui" || path === "/ui/") && window.location.hash === "#runs") return "runs";
+  if (path.includes("/projects")) return "projects";
   if (path.includes("/runs/")) return "run";
   if (path.endsWith("/repository")) return "repository";
   if (path.endsWith("/provider")) return "provider";
@@ -256,6 +333,11 @@ function runIdFromPath() {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
+function projectIdFromPath() {
+  const match = window.location.pathname.match(/\/ui\/projects\/([^/]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 function statusTone(value: string) {
   const lower = value.toLowerCase();
   if (["failed", "cancelled", "blocked", "unavailable", "invalid"].some((item) => lower.includes(item))) return "bad";
@@ -265,7 +347,8 @@ function statusTone(value: string) {
 
 function App() {
   const [view, setView] = useState(currentView());
-  const [data, setData] = useState<AppData>({ runs: [], backups: [] });
+  const [data, setData] = useState<AppData>({ runs: [], backups: [], projects: [], sourceRepos: [] });
+  const [project, setProject] = useState<ProjectDetail | null>(null);
   const [run, setRun] = useState<RunSummary | null>(null);
   const [events, setEvents] = useState<EventItem[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -279,16 +362,18 @@ function App() {
   const [loading, setLoading] = useState(true);
 
   const loadGlobal = useCallback(async () => {
-    const [health, provider, repository, github, config, runs, backups] = await Promise.all([
+    const [health, provider, repository, github, config, runs, backups, projects, sourceRepos] = await Promise.all([
       api<Health>("/api/health"),
       api<ProviderHealth>("/api/health/provider"),
       api<RepositoryHealth>("/api/health/repository"),
       api<GithubHealth>("/api/health/github"),
       api<ConfigSummary>("/api/config"),
       api<RunSummary[]>("/api/runs?limit=24"),
-      api<BackupItem[]>("/api/backups")
+      api<BackupItem[]>("/api/backups"),
+      api<ProjectSummary[]>("/api/projects"),
+      api<SavedSourceRepo[]>("/api/source-repos")
     ]);
-    setData({ health, provider, repository, github, config, runs, backups });
+    setData({ health, provider, repository, github, config, runs, backups, projects, sourceRepos });
   }, []);
 
   const loadRun = useCallback(async (id: string) => {
@@ -312,6 +397,11 @@ function App() {
     });
   }, []);
 
+  const loadProject = useCallback(async (id: string) => {
+    const projectData = await api<ProjectDetail>(`/api/projects/${id}`);
+    setProject(projectData);
+  }, []);
+
   const clearRunDetail = useCallback(() => {
     setRun(null);
     setEvents([]);
@@ -321,6 +411,10 @@ function App() {
     setWorkspaceFiles([]);
     setSelectedFile("");
     setFileContent("");
+  }, []);
+
+  const clearProjectDetail = useCallback(() => {
+    setProject(null);
   }, []);
 
   const refreshAll = useCallback(
@@ -333,10 +427,16 @@ function App() {
         const nextView = currentView();
         setView(nextView);
         const id = runIdFromPath();
+        const projectId = projectIdFromPath();
         if (id) {
           await loadRun(id);
         } else {
           clearRunDetail();
+        }
+        if (projectId) {
+          await loadProject(projectId);
+        } else if (nextView !== "projects") {
+          clearProjectDetail();
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unable to load console data.");
@@ -344,7 +444,7 @@ function App() {
         if (initial) setLoading(false);
       }
     },
-    [loadGlobal, loadRun, clearRunDetail]
+    [loadGlobal, loadRun, loadProject, clearRunDetail, clearProjectDetail]
   );
 
   useEffect(() => {
@@ -371,6 +471,12 @@ function App() {
 
   const activeRun = runIdFromPath();
 
+  useEffect(() => {
+    if (view !== "runs" || loading) return;
+    const section = document.getElementById("runs");
+    if (section) section.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [view, loading]);
+
   return (
     <div className="app-shell">
       <aside className="rail">
@@ -384,7 +490,7 @@ function App() {
         <nav>
           {nav.map((item) => {
             const Icon = item.icon;
-            const active = item.key === view || (item.key === "runs" && view === "run");
+            const active = item.key === view || (item.key === "runs" && (view === "run" || view === "runs"));
             return (
               <a className={active ? "active" : ""} href={item.href} key={item.key}>
                 <Icon size={18} />
@@ -419,7 +525,7 @@ function App() {
         {error && <Banner tone="bad" message={error} onClose={() => setError("")} />}
         {loading ? <LoadingPanel /> : null}
 
-        {!loading && view === "dashboard" && (
+        {!loading && (view === "dashboard" || view === "runs") && (
           <Dashboard
             data={data}
             onNotice={setNotice}
@@ -428,6 +534,21 @@ function App() {
             onRunCreated={async (runId) => {
               window.history.pushState({}, "", `/ui/runs/${runId}`);
               setView("run");
+              await refreshAll();
+            }}
+          />
+        )}
+        {!loading && view === "projects" && (
+          <ProjectsView
+            projects={data.projects}
+            sourceRepos={data.sourceRepos}
+            project={project}
+            onNotice={setNotice}
+            onError={setError}
+            onRefresh={refreshAll}
+            onOpenProject={async (projectId) => {
+              window.history.pushState({}, "", `/ui/projects/${projectId}`);
+              setView("projects");
               await refreshAll();
             }}
           />
@@ -462,6 +583,8 @@ function App() {
 
 function titleForView(view: string, run: RunSummary | null) {
   if (view === "run") return run ? run.task.title : "Run detail";
+  if (view === "runs") return "Runs";
+  if (view === "projects") return "Projects";
   if (view === "repository") return "Repository";
   if (view === "provider") return "Provider";
   if (view === "settings") return "Settings";
@@ -488,6 +611,471 @@ function LoadingPanel() {
       <Loader2 className="spin" size={22} />
       <span>Loading console state</span>
     </section>
+  );
+}
+
+function ProjectsView({
+  projects,
+  sourceRepos,
+  project,
+  onNotice,
+  onError,
+  onRefresh,
+  onOpenProject
+}: {
+  projects: ProjectSummary[];
+  sourceRepos: SavedSourceRepo[];
+  project: ProjectDetail | null;
+  onNotice: (message: string) => void;
+  onError: (message: string) => void;
+  onRefresh: () => Promise<void>;
+  onOpenProject: (projectId: string) => Promise<void>;
+}) {
+  const [projectSourceRepo, setProjectSourceRepo] = useState("");
+  const [projectSourceMode, setProjectSourceMode] = useState<"default" | "saved" | "custom">("default");
+  const [loadRepoSpec, setLoadRepoSpec] = useState("");
+  const [loadRepoLabel, setLoadRepoLabel] = useState("");
+
+  const saveSourceRepo = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const spec = loadRepoSpec.trim();
+    if (!spec) return;
+    try {
+      const saved = await api<SavedSourceRepo>("/api/source-repos", {
+        method: "POST",
+        body: JSON.stringify({
+          source_repo: spec,
+          label: loadRepoLabel.trim() || null
+        })
+      });
+      setProjectSourceMode("saved");
+      setProjectSourceRepo(saved.source_repo_spec);
+      setLoadRepoSpec("");
+      setLoadRepoLabel("");
+      onNotice(`Repo saved: ${saved.label}`);
+      await onRefresh();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Repo save failed.");
+    }
+  };
+
+  const createProject = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      const created = await api<ProjectDetail>("/api/projects", {
+        method: "POST",
+        body: JSON.stringify({
+          name: String(form.get("name") || ""),
+          initial_requirements: String(form.get("initial_requirements") || ""),
+          source_repo: projectSourceRepo.trim() || null,
+          app_type: String(form.get("app_type") || "") || null,
+          validation_profile: String(form.get("validation_profile") || "python")
+        })
+      });
+      onNotice("Project created. Intake questions are ready.");
+      await onOpenProject(created.id);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Project creation failed.");
+    }
+  };
+
+  return (
+    <div className="project-workbench">
+      <aside className="project-sidebar">
+        <section className="panel">
+          <div className="panel-head">
+            <div>
+              <p className="eyebrow">Load repo</p>
+              <h2>Saved sources</h2>
+            </div>
+            <GitBranch size={20} />
+          </div>
+          <form className="form-grid compact-form repo-load-form" onSubmit={saveSourceRepo}>
+            <input
+              value={loadRepoLabel}
+              onChange={(event) => setLoadRepoLabel(event.target.value)}
+              placeholder="Repo label, optional"
+            />
+            <input
+              value={loadRepoSpec}
+              onChange={(event) => setLoadRepoSpec(event.target.value)}
+              placeholder="Local path or remote URL"
+              required
+            />
+            <button type="submit"><Save size={16} /> Save Repo</button>
+          </form>
+          {sourceRepos.length > 0 ? (
+            <div className="saved-repo-list">
+              {sourceRepos.map((repo) => (
+                <button
+                  className={projectSourceRepo === repo.source_repo_spec ? "saved-repo-item active" : "saved-repo-item"}
+                  type="button"
+                  key={repo.id}
+                  onClick={() => {
+                    setProjectSourceMode("saved");
+                    setProjectSourceRepo(repo.source_repo_spec);
+                  }}
+                >
+                  <strong>{repo.label}</strong>
+                  <span>{repo.valid === false ? "invalid" : repo.kind}{repo.branch ? ` · ${repo.branch}` : ""}{repo.dirty ? " · dirty" : ""}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="empty compact-empty">No saved repos.</div>
+          )}
+        </section>
+        <section className="panel">
+          <div className="panel-head">
+            <div>
+              <p className="eyebrow">Projects</p>
+              <h2>App workspaces</h2>
+            </div>
+            <FolderKanban size={20} />
+          </div>
+          <form className="form-grid compact-form" onSubmit={createProject}>
+            <input name="name" placeholder="Project name" required />
+            <input name="app_type" placeholder="App type, e.g. SaaS, internal tool" />
+            <select
+              value={
+                projectSourceMode === "custom"
+                  ? "__custom__"
+                  : projectSourceMode === "saved"
+                    ? projectSourceRepo
+                    : ""
+              }
+              onChange={(event) => {
+                const value = event.target.value;
+                if (value === "__custom__") {
+                  setProjectSourceMode("custom");
+                  setProjectSourceRepo("");
+                  return;
+                }
+                if (!value) {
+                  setProjectSourceMode("default");
+                  setProjectSourceRepo("");
+                  return;
+                }
+                setProjectSourceMode("saved");
+                setProjectSourceRepo(value);
+              }}
+            >
+              <option value="">Default configured repo</option>
+              {sourceRepos.map((repo) => (
+                <option value={repo.source_repo_spec} key={repo.id}>{repo.label}</option>
+              ))}
+              <option value="__custom__">Custom path or URL</option>
+            </select>
+            {projectSourceMode === "custom" ? (
+              <input
+                value={projectSourceRepo}
+                onChange={(event) => setProjectSourceRepo(event.target.value)}
+                placeholder="Source repo path or URL"
+              />
+            ) : null}
+            <select name="validation_profile" defaultValue="full-stack">
+              <option value="python">Python</option>
+              <option value="frontend">Frontend</option>
+              <option value="full-stack">Full-stack</option>
+              <option value="new-app">New app</option>
+            </select>
+            <textarea
+              name="initial_requirements"
+              placeholder="Describe the app you want. The assistant will ask questions before building."
+              required
+            />
+            <button type="submit"><MessageSquare size={16} /> Create Project Chat</button>
+          </form>
+        </section>
+        <section className="panel project-list-panel">
+          <div className="list">
+            {projects.length === 0 && <div className="empty">No projects yet.</div>}
+            {projects.map((item) => (
+              <a
+                className={project?.id === item.id ? "project-list-item active" : "project-list-item"}
+                href={`/ui/projects/${item.id}`}
+                key={item.id}
+              >
+                <strong>{item.name}</strong>
+                <span>{item.readiness_score}% ready · {item.open_questions} questions</span>
+                <StatusPill value={item.status} />
+              </a>
+            ))}
+          </div>
+        </section>
+      </aside>
+      {project ? (
+        <ProjectDetailView
+          project={project}
+          onNotice={onNotice}
+          onError={onError}
+          onRefresh={onRefresh}
+        />
+      ) : (
+        <section className="panel project-empty-state">
+          <FolderKanban size={28} />
+          <h2>Select or create a project</h2>
+          <p className="muted">
+            Each project gets its own chat, intake questions, build plan, agent queue, and
+            validation profile.
+          </p>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function ProjectDetailView({
+  project,
+  onNotice,
+  onError,
+  onRefresh
+}: {
+  project: ProjectDetail;
+  onNotice: (message: string) => void;
+  onError: (message: string) => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const [draft, setDraft] = useState("");
+  const sendMessage = async (message: string) => {
+    const trimmed = message.trim();
+    if (!trimmed) return;
+    try {
+      const result = await api<ProjectCommandResponse>(`/api/projects/${project.id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ content: trimmed })
+      });
+      setDraft("");
+      if (result.run_ids.length > 1) onNotice(`${result.run_ids.length} parallel agent runs started.`);
+      else if (result.run_id) onNotice(`Agent run started: ${result.run_id}`);
+      else onNotice("Project chat updated.");
+      await onRefresh();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Project command failed.");
+    }
+  };
+  const answerQuestion = async (question: ProjectQuestion, answer: string) => {
+    if (!answer.trim()) return;
+    try {
+      await api<ProjectDetail>(`/api/projects/${project.id}/questions/${question.id}/answer`, {
+        method: "POST",
+        body: JSON.stringify({ answer })
+      });
+      onNotice("Question answered.");
+      await onRefresh();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Answer failed.");
+    }
+  };
+  const approvePlan = async () => {
+    try {
+      await api<ProjectDetail>(`/api/projects/${project.id}/plan/approve`, {
+        method: "POST",
+        body: "{}"
+      });
+      onNotice("Build plan approved.");
+      await onRefresh();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Plan approval failed.");
+    }
+  };
+  const startBuild = async () => {
+    try {
+      const result = await api<ProjectCommandResponse>(`/api/projects/${project.id}/start-build`, {
+        method: "POST",
+        body: "{}"
+      });
+      if (result.run_ids.length > 1) onNotice(`${result.run_ids.length} parallel agent runs started.`);
+      else if (result.run_id) onNotice(`Agent run started: ${result.run_id}`);
+      else {
+        const lastMessage = result.project.messages[result.project.messages.length - 1];
+        onNotice(lastMessage?.content || "Start command processed.");
+      }
+      await onRefresh();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Start build failed.");
+    }
+  };
+  const openQuestions = project.questions.filter((item) => item.status === "open");
+  return (
+    <div className="project-main">
+      <section className="panel project-hero-panel">
+        <div className="project-title-row">
+          <div>
+            <p className="eyebrow">Project workspace</p>
+            <h2>{project.name}</h2>
+            <p className="muted">{project.initial_requirements}</p>
+          </div>
+          <div className="project-score">
+            <strong>{project.readiness_score}%</strong>
+            <span>requirements ready</span>
+          </div>
+        </div>
+        <div className="chip-row">
+          <span>{humanizeSnake(project.status)}</span>
+          <span>{project.validation_profile}</span>
+          <span>{project.source_repo_spec || "default repo"}</span>
+        </div>
+        <div className="action-row">
+          <button className="ghost" type="button" onClick={() => void sendMessage("create plan")}>
+            <FileText size={16} /> Create Plan
+          </button>
+          <button type="button" onClick={approvePlan}>
+            <Check size={16} /> Approve Plan
+          </button>
+          <button type="button" onClick={startBuild}>
+            <Play size={16} /> Start Agents
+          </button>
+          <button className="ghost" type="button" onClick={() => void sendMessage("status")}>
+            <Activity size={16} /> Status
+          </button>
+          <button className="warn" type="button" onClick={() => void sendMessage("pause")}>
+            <Square size={16} /> Pause
+          </button>
+        </div>
+      </section>
+
+      <section className="project-grid">
+        <section className="panel chat-panel">
+          <div className="panel-head">
+            <div>
+              <p className="eyebrow">Interactive chat</p>
+              <h2>Requirements and commands</h2>
+            </div>
+            <MessageSquare size={20} />
+          </div>
+          <div className="chat-stream">
+            {project.messages.map((message) => (
+              <div className={`chat-bubble ${message.role}`} key={message.id}>
+                <span>{message.role} · {humanizeSnake(message.message_type)}</span>
+                <p>{message.content}</p>
+              </div>
+            ))}
+          </div>
+          <form
+            className="chat-compose"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void sendMessage(draft);
+            }}
+          >
+            <textarea
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="Answer a question or type a command: create plan, approve plan, start build, pause, status"
+            />
+            <button type="submit"><Send size={16} /> Send</button>
+          </form>
+        </section>
+
+        <section className="panel question-panel">
+          <div className="panel-head">
+            <div>
+              <p className="eyebrow">Open questions</p>
+              <h2>{openQuestions.length} needed before build</h2>
+            </div>
+            <HelpCircle size={20} />
+          </div>
+          <div className="list">
+            {project.questions.map((question) => (
+              <QuestionCard
+                question={question}
+                onAnswer={(answer) => answerQuestion(question, answer)}
+                key={question.id}
+              />
+            ))}
+          </div>
+        </section>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <p className="eyebrow">Build plan</p>
+            <h2>Scoped agent work</h2>
+          </div>
+          <Boxes size={20} />
+        </div>
+        <div className="build-items">
+          {project.build_items_detail.length === 0 && (
+            <div className="empty">No build items yet. Answer questions, then create a plan.</div>
+          )}
+          {project.build_items_detail.map((item) => (
+            <div className="build-item" key={item.id}>
+              <div>
+                <strong>{item.title}</strong>
+                <p className="muted">{item.description}</p>
+                <div className="chip-row">
+                  <span>{item.assigned_role}</span>
+                  <span>{item.status}</span>
+                  {item.depends_on.length > 0 ? <span>waits for {item.depends_on.length}</span> : <span>parallel-ready</span>}
+                  {item.target_files.map((file) => <span key={file}>{file}</span>)}
+                </div>
+              </div>
+              {item.run_id ? (
+                <a className="button ghost compact" href={`/ui/runs/${item.run_id}`}>
+                  Open run
+                </a>
+              ) : (
+                <StatusPill value={item.status} />
+              )}
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function QuestionCard({
+  question,
+  onAnswer
+}: {
+  question: ProjectQuestion;
+  onAnswer: (answer: string) => Promise<void>;
+}) {
+  const [answer, setAnswer] = useState(question.answer || "");
+  const answered = question.status === "answered";
+  return (
+    <div className={answered ? "question-card answered" : "question-card"}>
+      <div className="question-card-head">
+        <StatusPill value={question.status} />
+        <span>{question.key}</span>
+      </div>
+      <strong>{question.question}</strong>
+      <p className="muted">{question.reason}</p>
+      {question.options.length > 0 && (
+        <div className="chip-row">
+          {question.options.map((option) => (
+            <button
+              className="ghost compact"
+              type="button"
+              onClick={() => setAnswer(option)}
+              key={option}
+            >
+              {option}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="question-answer-row">
+        <input
+          value={answer}
+          onChange={(event) => setAnswer(event.target.value)}
+          placeholder="Answer"
+          disabled={answered}
+        />
+        <button
+          className="compact"
+          type="button"
+          onClick={() => void onAnswer(answer)}
+          disabled={answered}
+        >
+          Save
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -525,7 +1113,17 @@ function Dashboard({
         <Metric icon={<Database />} label="API" value={data.health?.status || "unknown"} />
         <Metric icon={<Activity />} label="Provider" value={data.provider?.status || "unknown"} />
         <Metric icon={<GitBranch />} label="Branch" value={data.repository?.branch || "unknown"} />
-        <Metric icon={<Shield />} label="GitHub" value={data.github?.configured ? "configured" : "missing"} />
+        <Metric
+          icon={<Shield />}
+          label="GitHub"
+          value={
+            data.github?.configured
+              ? "configured"
+              : data.github?.repo_full_name
+                ? "repo set / token missing"
+                : "token missing"
+          }
+        />
       </section>
       <section className="dashboard-grid">
         <TaskComposer onNotice={onNotice} onError={onError} onRunCreated={onRunCreated} />
@@ -601,87 +1199,6 @@ function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; 
   );
 }
 
-function TaskComposer({
-  onNotice,
-  onError,
-  onRunCreated
-}: {
-  onNotice: (message: string) => void;
-  onError: (message: string) => void;
-  onRunCreated: (runId: string) => Promise<void>;
-}) {
-  const submit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    try {
-      const stageModelsRaw = String(form.get("stage_models_json") || "").trim();
-      let stage_models: Record<string, string> | null = null;
-      if (stageModelsRaw) {
-        try {
-          const parsed = JSON.parse(stageModelsRaw) as Record<string, string>;
-          stage_models = typeof parsed === "object" && parsed !== null ? parsed : null;
-        } catch {
-          throw new Error("stage_models_json must be valid JSON object, e.g. {\"coder\":\"my-model-id\"}");
-        }
-      }
-      const created = await api<{ run_id: string }>("/api/tasks", {
-        method: "POST",
-        body: JSON.stringify({
-          title: String(form.get("title") || ""),
-          request_text: String(form.get("request_text") || ""),
-          workspace_path: String(form.get("workspace_path") || "") || null,
-          task_type: String(form.get("task_type") || "") || null,
-          target_files: splitCsv(String(form.get("target_files") || "")),
-          constraints: splitCsv(String(form.get("constraints") || "")),
-          provider: String(form.get("provider") || "") || null,
-          model: String(form.get("model") || "") || null,
-          source_repo: String(form.get("source_repo") || "") || null,
-          use_scout: form.get("use_scout") === "on",
-          stage_models
-        })
-      });
-      onNotice(`Task created: ${created.run_id}`);
-      await onRunCreated(created.run_id);
-    } catch (err) {
-      onError(err instanceof Error ? err.message : "Task creation failed.");
-    }
-  };
-
-  return (
-    <section className="panel">
-      <div className="panel-head">
-        <div>
-          <p className="eyebrow">New task</p>
-          <h2>Start an agent run</h2>
-        </div>
-        <Play size={20} />
-      </div>
-      <form className="form-grid" onSubmit={submit}>
-        <input name="title" placeholder="Run title" required />
-        <input name="workspace_path" placeholder="Workspace path (optional)" />
-        <div className="two-col">
-          <input name="task_type" placeholder="Task type" />
-          <input name="provider" placeholder="Provider" />
-        </div>
-        <input name="model" placeholder="Model override" />
-        <input name="source_repo" placeholder="Source repo path or URL (optional; requires ALLOWED_GIT_HOSTS for remotes)" />
-        <label className="muted" style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-          <input type="checkbox" name="use_scout" /> Use read-only scout preamble for planner
-        </label>
-        <textarea name="stage_models_json" placeholder='Optional per-stage models JSON, e.g. {"coder":"model-id"}' rows={2} />
-        <input name="target_files" placeholder="Target files, comma-separated" />
-        <input name="constraints" placeholder="Constraints, comma-separated" />
-        <textarea name="request_text" placeholder="Describe the implementation task." required />
-        <button type="submit"><Play size={16} /> Start Run</button>
-      </form>
-    </section>
-  );
-}
-
-function splitCsv(value: string) {
-  return value.split(",").map((item) => item.trim()).filter(Boolean);
-}
-
 function RunCard({ run }: { run: RunSummary }) {
   return (
     <a className="run-card" href={`/ui/runs/${run.id}`}>
@@ -703,6 +1220,49 @@ function RunCard({ run }: { run: RunSummary }) {
 }
 
 function RepositoryView({ repository }: { repository?: RepositoryHealth }) {
+  const isDirty = repository?.dirty === true;
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [copyNotice, setCopyNotice] = useState<string | null>(null);
+  const fixOptions = [
+    {
+      key: "commit",
+      label: "1) Keep your work (recommended)",
+      command: "git add -A && git commit -m \"WIP: save local changes\""
+    },
+    {
+      key: "stash",
+      label: "2) Stash changes temporarily",
+      command: "git stash push -u -m \"temp-cleanup\" && git stash list"
+    },
+    {
+      key: "discard",
+      label: "3) Drop local changes (destructive)",
+      command: "git restore --staged . && git restore . && git clean -fd"
+    }
+  ];
+
+  const copyCommand = async (key: string, command: string) => {
+    const fallbackCopyPrompt = () => {
+      window.prompt("Clipboard is unavailable here. Copy this command manually:", command);
+      setCopyNotice("Clipboard API unavailable. Prompt shown for manual copy.");
+    };
+
+    try {
+      if (!navigator.clipboard || !window.isSecureContext) {
+        fallbackCopyPrompt();
+        return;
+      }
+      await navigator.clipboard.writeText(command);
+      setCopiedKey(key);
+      setCopyNotice(null);
+      window.setTimeout(() => {
+        setCopiedKey((current) => (current === key ? null : current));
+      }, 1400);
+    } catch {
+      fallbackCopyPrompt();
+    }
+  };
+
   return (
     <section className="panel">
       <div className="panel-head">
@@ -712,13 +1272,37 @@ function RepositoryView({ repository }: { repository?: RepositoryHealth }) {
         </div>
         <GitBranch size={22} />
       </div>
-      <InfoRows rows={[
-        ["Path", repository?.path || "-"],
-        ["Branch", repository?.branch || "-"],
-        ["Head SHA", repository?.head_sha || "-"],
-        ["Dirty", String(repository?.dirty ?? "-")],
-        ["Remotes", repository?.remotes?.join(", ") || "No remotes configured"]
-      ]} />
+      <details className="repo-details" open>
+        <summary>Repository details</summary>
+        <InfoRows rows={[
+          ["Path", repository?.path || "-"],
+          ["Branch", repository?.branch || "-"],
+          ["Head SHA", repository?.head_sha || "-"],
+          ["Dirty", String(repository?.dirty ?? "-")],
+          ["Remotes", repository?.remotes?.join(", ") || "No remotes configured"]
+        ]} />
+      </details>
+      {isDirty ? (
+        <details className="repo-details repo-dirty-details">
+          <summary>Dirty working tree: fix options</summary>
+          <p className="muted">The checkout has uncommitted changes. Pick one approach:</p>
+          {copyNotice ? <p className="muted repo-copy-notice">{copyNotice}</p> : null}
+          <div className="repo-fix-options">
+            {fixOptions.map((option) => (
+              <div key={option.key}>
+                <div className="repo-fix-option-head">
+                  <strong>{option.label}</strong>
+                  <button type="button" className="ghost compact" onClick={() => void copyCommand(option.key, option.command)}>
+                    {copiedKey === option.key ? <Check size={14} /> : <Copy size={14} />}
+                    {copiedKey === option.key ? "Copied" : "Copy command"}
+                  </button>
+                </div>
+                <pre>{option.command}</pre>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
     </section>
   );
 }
@@ -750,6 +1334,19 @@ function ProviderView({ data }: { data: AppData }) {
           <Shield size={22} />
         </div>
         <p className="muted">{data.github?.detail || "No GitHub status available."}</p>
+        {data.github?.repo_full_name ? (
+          <InfoRows
+            rows={[
+              ["Canonical repo", data.github.repo_full_name],
+              ["Default branch", String(data.github.repo_default_branch || "-")],
+              ["Web", data.github.repo_html_url || "-"],
+              ["Clone (HTTPS)", data.github.repo_clone_url || "-"],
+              ["API user", data.github.login ? String(data.github.login) : "-"]
+            ]}
+          />
+        ) : (
+          <p className="muted">Set GITHUB_REPO_FULL_NAME under Settings to show canonical repo links.</p>
+        )}
       </section>
     </div>
   );
@@ -773,7 +1370,7 @@ function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; o
 
   useEffect(() => {
     void refreshModels();
-  }, [String(runtime.lmstudio_base_url), String(runtime.lmstudio_api_key)]);
+  }, [String(runtime.lmstudio_base_url), String(runtime.lmstudio_api_key_configured ?? "")]);
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -804,6 +1401,9 @@ function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; o
           ))}
         </datalist>
         {modelsError ? <p className="muted">Model list: {modelsError}</p> : null}
+        <p className="muted">
+          LM Studio API key is {runtime.lmstudio_api_key_configured ? "configured" : "not configured"}.
+        </p>
         <div className="two-col">
           <button className="ghost compact" type="button" onClick={() => void refreshModels()}>
             <RefreshCw size={16} /> Refresh LM Studio models
@@ -812,7 +1412,7 @@ function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; o
         <input name="APP_HOST" defaultValue={String(runtime.app_host || "0.0.0.0")} placeholder="APP_HOST" />
         <input name="APP_PORT" defaultValue={String(runtime.app_port || "8400")} placeholder="APP_PORT" />
         <input name="APP_API_TOKEN" type="hidden" value="__UNCHANGED__" readOnly />
-        <input name="WORKER_COUNT" defaultValue={String(config?.worker_count ?? 1)} placeholder="WORKER_COUNT" />
+        <input name="WORKER_COUNT" defaultValue={String(config?.worker_count ?? 3)} placeholder="WORKER_COUNT" />
         <input name="LMSTUDIO_BASE_URL" defaultValue={String(runtime.lmstudio_base_url || "")} placeholder="LMSTUDIO_BASE_URL" />
         <input name="LMSTUDIO_MODEL" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model || "")} placeholder="LMSTUDIO_MODEL" />
         <input name="LMSTUDIO_MODEL_PLANNER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_planner || "")} placeholder="LMSTUDIO_MODEL_PLANNER" />
@@ -822,10 +1422,26 @@ function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; o
         <input name="LMSTUDIO_MODEL_REVIEWER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_reviewer || "")} placeholder="LMSTUDIO_MODEL_REVIEWER" />
         <input name="LMSTUDIO_MODEL_TESTER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_tester || "")} placeholder="LMSTUDIO_MODEL_TESTER" />
         <input name="LMSTUDIO_MODEL_SUPERVISOR" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_supervisor || "")} placeholder="LMSTUDIO_MODEL_SUPERVISOR" />
-        <input name="LMSTUDIO_API_KEY" defaultValue={String(runtime.lmstudio_api_key || "")} placeholder="LMSTUDIO_API_KEY" />
+        <input
+          name="LMSTUDIO_API_KEY"
+          type="password"
+          defaultValue="__UNCHANGED__"
+          placeholder="LMSTUDIO_API_KEY (leave as __UNCHANGED__ to keep current)"
+        />
         <input name="PROVIDER_TIMEOUT_SECONDS" defaultValue={String(runtime.provider_timeout_seconds || "60")} placeholder="PROVIDER_TIMEOUT_SECONDS" />
         <input name="GIT_CLONE_TIMEOUT_SECONDS" defaultValue={String(runtime.git_clone_timeout_seconds || "300")} placeholder="GIT_CLONE_TIMEOUT_SECONDS" />
         <input name="SOURCE_REPO_PATH" defaultValue={String(runtime.source_repo_path || "")} placeholder="SOURCE_REPO_PATH" />
+        <p className="muted">Canonical GitHub repo for this platform (owner/repo, used in Provider view and health).</p>
+        <input
+          name="GITHUB_REPO_FULL_NAME"
+          defaultValue={String(runtime.github_repo_full_name || "")}
+          placeholder="GITHUB_REPO_FULL_NAME (e.g. hamedmirza/AI-Dev-Platform)"
+        />
+        <input
+          name="GITHUB_REPO_DEFAULT_BRANCH"
+          defaultValue={String(runtime.github_repo_default_branch || "main")}
+          placeholder="GITHUB_REPO_DEFAULT_BRANCH"
+        />
         <input name="ALLOWED_GIT_HOSTS" defaultValue={String(runtime.allowed_git_hosts || "")} placeholder="ALLOWED_GIT_HOSTS" />
         <input name="ALLOWED_SOURCE_REPO_ROOTS" defaultValue={String(runtime.allowed_source_repo_roots || "")} placeholder="ALLOWED_SOURCE_REPO_ROOTS" />
         <input name="WORKSPACE_ROOT" defaultValue={String(runtime.workspace_root || "")} placeholder="WORKSPACE_ROOT" />
