@@ -7,6 +7,9 @@ from app.core.exceptions import ConfigurationError
 from app.tools.base import CommandResult
 
 ALLOWED_VALIDATION_COMMANDS = {
+    ("npm", "run", "lint"),
+    ("npm", "run", "test"),
+    ("npm", "run", "typecheck"),
     ("ruff", "check", "."),
     ("mypy", "app"),
     ("pytest", "-q"),

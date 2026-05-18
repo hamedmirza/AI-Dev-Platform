@@ -59,11 +59,16 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     from app.db.models import (  # noqa: F401
         ArtifactModel,
+        ProjectBuildItemModel,
+        ProjectMessageModel,
+        ProjectModel,
+        ProjectQuestionModel,
         RepoLessonModel,
         RolePlaybookModel,
         RunEventModel,
         RunModel,
         RunStateSnapshotModel,
+        SavedSourceRepoModel,
         TaskModel,
     )
 
@@ -71,6 +76,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     cast(Table, RepoLessonModel.__table__).create(bind=engine, checkfirst=True)
     cast(Table, RolePlaybookModel.__table__).create(bind=engine, checkfirst=True)
+    cast(Table, SavedSourceRepoModel.__table__).create(bind=engine, checkfirst=True)
     _apply_lightweight_migrations(engine)
 
 

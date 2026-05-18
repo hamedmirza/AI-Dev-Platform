@@ -658,6 +658,7 @@ def test_startup_recovery_closes_stale_active_runs_and_requeues_pending(
 
     session = get_session_factory()()
     try:
+        stale_time = datetime.now(timezone.utc) - timedelta(minutes=30)
         task = TaskModel(title="Recover runs", request_text="Recover stale runs")
         session.add(task)
         session.flush()
@@ -666,12 +667,14 @@ def test_startup_recovery_closes_stale_active_runs_and_requeues_pending(
             status="running",
             current_stage="planner",
             provider_name="fake",
+            updated_at=stale_time,
         )
         queued = RunModel(
             task_id=task.id,
             status="queued",
             current_stage="intake",
             provider_name="fake",
+            updated_at=stale_time,
         )
         pending = RunModel(
             task_id=task.id,
@@ -702,6 +705,57 @@ def test_startup_recovery_closes_stale_active_runs_and_requeues_pending(
         assert recovered_queued.status == "failed"
         assert recovered_pending.status == "pending"
         assert set(recovered) == {pending_id}
+    finally:
+        session.close()
+
+
+def test_startup_recovery_leaves_fresh_running_run_untouched(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "fresh-recovery.db"
+    monkeypatch.setenv("DB_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("APP_API_TOKEN", "test-token")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    monkeypatch.setenv("BACKUP_ROOT", str(tmp_path / "backups"))
+    clear_settings_cache()
+    reset_orchestration_service()
+    init_db()
+
+    session = get_session_factory()()
+    try:
+        task = TaskModel(title="Keep live run", request_text="Do not recover fresh run")
+        session.add(task)
+        session.flush()
+        running = RunModel(
+            task_id=task.id,
+            status="running",
+            current_stage="planner",
+            provider_name="fake",
+            updated_at=datetime.now(timezone.utc),
+        )
+        pending = RunModel(
+            task_id=task.id,
+            status="pending",
+            current_stage="intake",
+            provider_name="fake",
+        )
+        session.add_all([running, pending])
+        session.commit()
+        running_id = running.id
+        pending_id = pending.id
+    finally:
+        session.close()
+
+    recovered = OrchestrationService()._recover_interrupted_runs()
+
+    session = get_session_factory()()
+    try:
+        fresh_running = session.get(RunModel, running_id)
+        assert fresh_running is not None
+        assert fresh_running.status == "running"
+        assert fresh_running.error_message is None
+        assert recovered == [pending_id]
     finally:
         session.close()
 

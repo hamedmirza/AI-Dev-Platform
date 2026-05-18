@@ -1,3 +1,6 @@
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from app.core.exceptions import ConfigurationError
@@ -51,40 +54,113 @@ def test_coder_and_tester_prompts_include_safety_constraints() -> None:
     assert "grep" in tester_prompt
 
 
-def test_orchestration_requests_reinforce_ui_and_validation_constraints() -> None:
-    service = OrchestrationService()
-    coder_request = service._build_coder_request(
-        "Improve the UI.",
-        "missing-run",
-        [],
-        PlanResponse(
-            summary="Plan",
-            assumptions=[],
-            risks=[],
-            steps=[],
-            acceptance_criteria=[],
-        ),
-        ArchitectureResponse(
-            touched_modules=["app/ui"],
-            file_change_plan=["Update render helpers"],
-            dependency_notes=[],
-            migration_notes=[],
-        ),
-        UIDesignResponse(
-            design_summary="Modern UI",
-            visual_system=[],
-            layout_plan=[],
-            interaction_notes=[],
-            accessibility_notes=[],
-            implementation_notes=[],
-        ),
-        retry_feedback=[],
-    )
-    test_request = service._build_test_request("Improve the UI.", retry_feedback=[])
+def test_orchestration_requests_reinforce_ui_and_validation_constraints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.settings import clear_settings_cache
 
-    assert "Preserve existing FastAPI APIRouter setup" in coder_request
-    assert "Do not create a standalone FastAPI() app" in coder_request
-    assert "workspace editor" in coder_request
-    assert "Validation command whitelist" in test_request
-    assert "ruff check ." in test_request
-    assert "python -c" in test_request
+    workspace_root = tmp_path / "workspace"
+    run_id = "unit-coder-prompt"
+    run_dir = workspace_root / f"run-{run_id}"
+    (run_dir / "app" / "ui").mkdir(parents=True)
+    (run_dir / "app" / "ui" / "routes.py").write_text("# fixture routes\n", encoding="utf-8")
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace_root))
+    clear_settings_cache()
+    try:
+        service = OrchestrationService()
+        coder_request = service._build_coder_request(
+            "Improve the UI.",
+            run_id,
+            [],
+            PlanResponse(
+                summary="Plan",
+                assumptions=[],
+                risks=[],
+                steps=[],
+                acceptance_criteria=[],
+            ),
+            ArchitectureResponse(
+                touched_modules=["app/ui"],
+                file_change_plan=["Update render helpers"],
+                dependency_notes=[],
+                migration_notes=[],
+            ),
+            UIDesignResponse(
+                design_summary="Modern UI",
+                visual_system=[],
+                layout_plan=[],
+                interaction_notes=[],
+                accessibility_notes=[],
+                implementation_notes=[],
+            ),
+            retry_feedback=[],
+        )
+        test_request = service._build_test_request("Improve the UI.", retry_feedback=[])
+
+        assert "Preserve existing FastAPI APIRouter setup" in coder_request
+        assert "Do not create a standalone FastAPI() app" in coder_request
+        assert "workspace editor" in coder_request
+        assert "Validation command whitelist" in test_request
+        assert "ruff check ." in test_request
+        assert "python -c" in test_request
+    finally:
+        clear_settings_cache()
+
+
+def test_build_coder_request_external_repo_includes_file_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.settings import clear_settings_cache
+
+    workspace_root = tmp_path / "workspace"
+    run_id = "unit-ext-coder"
+    run_dir = workspace_root / f"run-{run_id}"
+    run_dir.mkdir(parents=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=run_dir, check=True, capture_output=True)
+    (run_dir / "package.json").write_text("{}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "package.json"], cwd=run_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=T", "-c", "user.email=t@e", "commit", "-m", "init"],
+        cwd=run_dir,
+        check=True,
+        capture_output=True,
+    )
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace_root))
+    clear_settings_cache()
+    try:
+        service = OrchestrationService()
+        text = service._build_coder_request(
+            "Fix bug",
+            run_id,
+            [],
+            PlanResponse(
+                summary="S",
+                assumptions=[],
+                risks=[],
+                steps=[],
+                acceptance_criteria=[],
+            ),
+            ArchitectureResponse(
+                touched_modules=[],
+                file_change_plan=[],
+                dependency_notes=[],
+                migration_notes=[],
+            ),
+            UIDesignResponse(
+                design_summary="D",
+                visual_system=[],
+                layout_plan=[],
+                interaction_notes=[],
+                accessibility_notes=[],
+                implementation_notes=[],
+            ),
+            retry_feedback=[],
+        )
+        assert "cloned application repository" in text
+        assert "Workspace file index" in text
+        assert "package.json" in text
+        assert "Preserve existing FastAPI APIRouter setup" not in text
+    finally:
+        clear_settings_cache()

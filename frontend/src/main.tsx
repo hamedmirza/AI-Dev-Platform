@@ -282,6 +282,22 @@ function humanizeSnake(s: string): string {
     .join(" ");
 }
 
+function formatEventTime(iso: string): string {
+  // API returns naive UTC strings without a timezone suffix — force UTC interpretation
+  const normalized = /[Z+\-]\d\d:?\d\d$|Z$/.test(iso) ? iso : `${iso}Z`;
+  const d = new Date(normalized);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  if (sameDay) {
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+  return (
+    d.toLocaleDateString([], { month: "short", day: "numeric" }) +
+    " · " +
+    d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+  );
+}
+
 function shouldShowArtifactTypeLabel(title: string, artifactType: string): boolean {
   const ti = title.toLowerCase().trim();
   const typeSlug = artifactType.toLowerCase().replace(/_/g, " ");
@@ -1352,15 +1368,105 @@ function ProviderView({ data }: { data: AppData }) {
   );
 }
 
+function runtimeSettingValue(runtime: Record<string, unknown>, key: string, fallback = ""): string {
+  const value = runtime[key];
+  if (value === undefined || value === null) return fallback;
+  return String(value);
+}
+
+function SettingsField({
+  name,
+  label,
+  description,
+  defaultValue = "",
+  type = "text",
+  placeholder,
+  fullWidth = false
+}: {
+  name: string;
+  label: string;
+  description: string;
+  defaultValue?: string;
+  type?: string;
+  placeholder?: string;
+  fullWidth?: boolean;
+}) {
+  const id = `settings-${name}`;
+  return (
+    <div className={`settings-field${fullWidth ? " settings-field-full" : ""}`}>
+      <label className="field-label" htmlFor={id}>
+        {label} <span className="field-env">({name})</span>
+      </label>
+      <p className="field-hint">{description}</p>
+      <input
+        id={id}
+        name={name}
+        type={type}
+        defaultValue={defaultValue}
+        placeholder={placeholder}
+      />
+    </div>
+  );
+}
+
+function ModelSelectField({
+  name,
+  label,
+  description,
+  defaultValue = "",
+  modelIds,
+  allowEmpty = false,
+  fullWidth = false
+}: {
+  name: string;
+  label: string;
+  description: string;
+  defaultValue?: string;
+  modelIds: string[];
+  allowEmpty?: boolean;
+  fullWidth?: boolean;
+}) {
+  const id = `settings-${name}`;
+  const sorted = useMemo(() => [...new Set(modelIds)].sort((a, b) => a.localeCompare(b)), [modelIds]);
+  const options = useMemo(() => {
+    const ids = [...sorted];
+    if (defaultValue && !ids.includes(defaultValue)) {
+      ids.unshift(defaultValue);
+    }
+    return ids;
+  }, [sorted, defaultValue]);
+
+  return (
+    <div className={`settings-field${fullWidth ? " settings-field-full" : ""}`}>
+      <label className="field-label" htmlFor={id}>
+        {label} <span className="field-env">({name})</span>
+      </label>
+      <p className="field-hint">{description}</p>
+      {options.length > 0 ? (
+        <select id={id} name={name} defaultValue={defaultValue}>
+          {allowEmpty ? <option value="">— Use default model —</option> : null}
+          {options.map((modelId) => (
+            <option value={modelId} key={modelId}>
+              {modelId}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input id={id} name={name} type="text" defaultValue={defaultValue} placeholder="Refresh models from LM Studio" />
+      )}
+    </div>
+  );
+}
+
 function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; onNotice: (message: string) => void; onError: (message: string) => void }) {
-  const runtime = config?.runtime || {};
+  const runtime = (config?.runtime || {}) as Record<string, unknown>;
   const [modelIds, setModelIds] = useState<string[]>([]);
   const [modelsError, setModelsError] = useState<string | null>(null);
 
   const refreshModels = async () => {
     try {
       const payload = await api<{ models: { id: string }[]; error: string | null }>("/api/config/lmstudio/models");
-      setModelsError(payload.error);
+      setModelsError(payload.error ? String(payload.error) : null);
       setModelIds((payload.models || []).map((m) => m.id).filter(Boolean));
     } catch (err) {
       setModelsError(err instanceof Error ? err.message : "Failed to load models");
@@ -1378,8 +1484,12 @@ function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; o
     const fields = Object.fromEntries(Array.from(form.entries()).map(([key, value]) => [key, String(value)]));
     fields.APP_API_TOKEN = "__UNCHANGED__";
     try {
-      await postForm("/ui/settings", fields);
-      onNotice("Settings saved.");
+      const response = await postForm("/ui/settings", fields);
+      if (response.type === "opaqueredirect" || response.status === 0 || response.ok) {
+        window.location.assign("/ui/settings?success=Settings+saved.");
+        return;
+      }
+      onError(`Settings save failed (${response.status}).`);
     } catch (err) {
       onError(err instanceof Error ? err.message : "Settings save failed.");
     }
@@ -1394,67 +1504,257 @@ function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; o
         </div>
         <Settings size={22} />
       </div>
+      <div className="settings-panel-scroll">
       <form className="settings-grid" onSubmit={submit}>
-        <datalist id="lmstudio-model-ids">
-          {modelIds.map((id) => (
-            <option value={id} key={id} />
-          ))}
-        </datalist>
-        {modelsError ? <p className="muted">Model list: {modelsError}</p> : null}
-        <p className="muted">
-          LM Studio API key is {runtime.lmstudio_api_key_configured ? "configured" : "not configured"}.
-        </p>
-        <div className="two-col">
+        <input name="APP_API_TOKEN" type="hidden" value="__UNCHANGED__" readOnly />
+
+        <h3 className="settings-section-title">Server</h3>
+        <SettingsField
+          name="APP_HOST"
+          label="Bind host"
+          description="Network interface the API listens on. Use 0.0.0.0 for all interfaces, or 127.0.0.1 for local-only."
+          defaultValue={runtimeSettingValue(runtime, "app_host", "0.0.0.0")}
+          placeholder="0.0.0.0"
+        />
+        <SettingsField
+          name="APP_PORT"
+          label="Port"
+          description="HTTP port for the platform API and UI."
+          defaultValue={runtimeSettingValue(runtime, "app_port", "8400")}
+          placeholder="8400"
+        />
+        <SettingsField
+          name="WORKER_COUNT"
+          label="Orchestration workers"
+          description="Number of background threads that process runs in parallel."
+          defaultValue={String(config?.worker_count ?? 3)}
+          placeholder="3"
+        />
+
+        <h3 className="settings-section-title">LM Studio</h3>
+        <div className="settings-field settings-field-full">
+          <p className="field-hint">
+            API key is {runtime.lmstudio_api_key_configured === true ? "configured" : "not configured"}.
+            {modelsError
+              ? ` Could not load models: ${modelsError}`
+              : modelIds.length > 0
+                ? ` ${modelIds.length} model(s) loaded — pick from the dropdowns below.`
+                : " No models loaded yet — save LM Studio URL if needed, then refresh."}
+          </p>
           <button className="ghost compact" type="button" onClick={() => void refreshModels()}>
-            <RefreshCw size={16} /> Refresh LM Studio models
+            <RefreshCw size={16} /> Refresh model list from LM Studio
           </button>
         </div>
-        <input name="APP_HOST" defaultValue={String(runtime.app_host || "0.0.0.0")} placeholder="APP_HOST" />
-        <input name="APP_PORT" defaultValue={String(runtime.app_port || "8400")} placeholder="APP_PORT" />
-        <input name="APP_API_TOKEN" type="hidden" value="__UNCHANGED__" readOnly />
-        <input name="WORKER_COUNT" defaultValue={String(config?.worker_count ?? 3)} placeholder="WORKER_COUNT" />
-        <input name="LMSTUDIO_BASE_URL" defaultValue={String(runtime.lmstudio_base_url || "")} placeholder="LMSTUDIO_BASE_URL" />
-        <input name="LMSTUDIO_MODEL" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model || "")} placeholder="LMSTUDIO_MODEL" />
-        <input name="LMSTUDIO_MODEL_PLANNER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_planner || "")} placeholder="LMSTUDIO_MODEL_PLANNER" />
-        <input name="LMSTUDIO_MODEL_ARCHITECT" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_architect || "")} placeholder="LMSTUDIO_MODEL_ARCHITECT" />
-        <input name="LMSTUDIO_MODEL_UI_DESIGNER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_ui_designer || "")} placeholder="LMSTUDIO_MODEL_UI_DESIGNER" />
-        <input name="LMSTUDIO_MODEL_CODER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_coder || "")} placeholder="LMSTUDIO_MODEL_CODER" />
-        <input name="LMSTUDIO_MODEL_REVIEWER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_reviewer || "")} placeholder="LMSTUDIO_MODEL_REVIEWER" />
-        <input name="LMSTUDIO_MODEL_TESTER" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_tester || "")} placeholder="LMSTUDIO_MODEL_TESTER" />
-        <input name="LMSTUDIO_MODEL_SUPERVISOR" list="lmstudio-model-ids" defaultValue={String(runtime.lmstudio_model_supervisor || "")} placeholder="LMSTUDIO_MODEL_SUPERVISOR" />
-        <input
+        <SettingsField
+          name="LMSTUDIO_BASE_URL"
+          label="API base URL"
+          description="OpenAI-compatible LM Studio endpoint."
+          defaultValue={runtimeSettingValue(runtime, "lmstudio_base_url")}
+          placeholder="http://localhost:1234/v1"
+          fullWidth
+        />
+        <ModelSelectField
+          name="LMSTUDIO_MODEL"
+          label="Default model"
+          description="Fallback model when a stage-specific override is empty."
+          defaultValue={runtimeSettingValue(runtime, "lmstudio_model")}
+          modelIds={modelIds}
+          fullWidth
+        />
+        <ModelSelectField
+          name="LMSTUDIO_MODEL_PLANNER"
+          label="Planner model"
+          description="Model for the planner stage. Leave empty to use the default model."
+          defaultValue={runtimeSettingValue(runtime, "lmstudio_model_planner")}
+          modelIds={modelIds}
+          allowEmpty
+        />
+        <ModelSelectField
+          name="LMSTUDIO_MODEL_ARCHITECT"
+          label="Architect model"
+          description="Model for architecture planning. Leave empty to use the default model."
+          defaultValue={runtimeSettingValue(runtime, "lmstudio_model_architect")}
+          modelIds={modelIds}
+          allowEmpty
+        />
+        <ModelSelectField
+          name="LMSTUDIO_MODEL_UI_DESIGNER"
+          label="UI designer model"
+          description="Model for UI design direction. Leave empty to use the default model."
+          defaultValue={runtimeSettingValue(runtime, "lmstudio_model_ui_designer")}
+          modelIds={modelIds}
+          allowEmpty
+        />
+        <ModelSelectField
+          name="LMSTUDIO_MODEL_CODER"
+          label="Coder model"
+          description="Model that proposes code patches. Leave empty to use the default model."
+          defaultValue={runtimeSettingValue(runtime, "lmstudio_model_coder")}
+          modelIds={modelIds}
+          allowEmpty
+        />
+        <ModelSelectField
+          name="LMSTUDIO_MODEL_REVIEWER"
+          label="Reviewer model"
+          description="Model that reviews proposed changes. Leave empty to use the default model."
+          defaultValue={runtimeSettingValue(runtime, "lmstudio_model_reviewer")}
+          modelIds={modelIds}
+          allowEmpty
+        />
+        <ModelSelectField
+          name="LMSTUDIO_MODEL_TESTER"
+          label="Tester model"
+          description="Model that defines validation commands. Leave empty to use the default model."
+          defaultValue={runtimeSettingValue(runtime, "lmstudio_model_tester")}
+          modelIds={modelIds}
+          allowEmpty
+        />
+        <ModelSelectField
+          name="LMSTUDIO_MODEL_SUPERVISOR"
+          label="Supervisor model"
+          description="Model for playbook supervisor flows. Leave empty to use the default model."
+          defaultValue={runtimeSettingValue(runtime, "lmstudio_model_supervisor")}
+          modelIds={modelIds}
+          allowEmpty
+        />
+        <SettingsField
           name="LMSTUDIO_API_KEY"
+          label="API key"
+          description="Authentication key sent to LM Studio. Leave as __UNCHANGED__ to keep the current value."
           type="password"
           defaultValue="__UNCHANGED__"
-          placeholder="LMSTUDIO_API_KEY (leave as __UNCHANGED__ to keep current)"
+          fullWidth
         />
-        <input name="PROVIDER_TIMEOUT_SECONDS" defaultValue={String(runtime.provider_timeout_seconds || "60")} placeholder="PROVIDER_TIMEOUT_SECONDS" />
-        <input name="GIT_CLONE_TIMEOUT_SECONDS" defaultValue={String(runtime.git_clone_timeout_seconds || "300")} placeholder="GIT_CLONE_TIMEOUT_SECONDS" />
-        <input name="SOURCE_REPO_PATH" defaultValue={String(runtime.source_repo_path || "")} placeholder="SOURCE_REPO_PATH" />
-        <p className="muted">Canonical GitHub repo for this platform (owner/repo, used in Provider view and health).</p>
-        <input
+        <SettingsField
+          name="PROVIDER_TIMEOUT_SECONDS"
+          label="LLM request timeout"
+          description="Maximum seconds per provider call before timing out."
+          defaultValue={runtimeSettingValue(runtime, "provider_timeout_seconds", "60")}
+          placeholder="60"
+        />
+
+        <h3 className="settings-section-title">Git and repositories</h3>
+        <SettingsField
+          name="GIT_CLONE_TIMEOUT_SECONDS"
+          label="Clone timeout"
+          description="Maximum seconds allowed when cloning a source repository into a run workspace."
+          defaultValue={runtimeSettingValue(runtime, "git_clone_timeout_seconds", "300")}
+          placeholder="300"
+        />
+        <SettingsField
+          name="SOURCE_REPO_PATH"
+          label="Default source checkout"
+          description="Local path to the platform's managed repository checkout, when used."
+          defaultValue={runtimeSettingValue(runtime, "source_repo_path")}
+          placeholder="/path/to/repo"
+        />
+        <SettingsField
           name="GITHUB_REPO_FULL_NAME"
-          defaultValue={String(runtime.github_repo_full_name || "")}
-          placeholder="GITHUB_REPO_FULL_NAME (e.g. hamedmirza/AI-Dev-Platform)"
+          label="Canonical GitHub repo"
+          description="owner/repo for this platform — shown on the Provider view and in health checks."
+          defaultValue={runtimeSettingValue(runtime, "github_repo_full_name")}
+          placeholder="hamedmirza/AI-Dev-Platform"
+          fullWidth
         />
-        <input
+        <SettingsField
           name="GITHUB_REPO_DEFAULT_BRANCH"
-          defaultValue={String(runtime.github_repo_default_branch || "main")}
-          placeholder="GITHUB_REPO_DEFAULT_BRANCH"
+          label="Default branch"
+          description="Default branch name for the canonical GitHub repository."
+          defaultValue={runtimeSettingValue(runtime, "github_repo_default_branch", "main")}
+          placeholder="main"
         />
-        <input name="ALLOWED_GIT_HOSTS" defaultValue={String(runtime.allowed_git_hosts || "")} placeholder="ALLOWED_GIT_HOSTS" />
-        <input name="ALLOWED_SOURCE_REPO_ROOTS" defaultValue={String(runtime.allowed_source_repo_roots || "")} placeholder="ALLOWED_SOURCE_REPO_ROOTS" />
-        <input name="WORKSPACE_ROOT" defaultValue={String(runtime.workspace_root || "")} placeholder="WORKSPACE_ROOT" />
-        <input name="BACKUP_ROOT" defaultValue={String(runtime.backup_root || "")} placeholder="BACKUP_ROOT" />
-        <input name="GIT_AUTHOR_NAME" defaultValue={String(runtime.git_author_name || "")} placeholder="GIT_AUTHOR_NAME" />
-        <input name="GIT_AUTHOR_EMAIL" defaultValue={String(runtime.git_author_email || "")} placeholder="GIT_AUTHOR_EMAIL" />
-        <input name="LOG_LEVEL" defaultValue={String(runtime.log_level || "INFO")} placeholder="LOG_LEVEL" />
-        <input name="USE_SCOUT_STAGE" defaultValue={String(runtime.use_scout_stage ?? "false")} placeholder="USE_SCOUT_STAGE" />
-        <input name="PLAYBOOK_SUPERVISOR_ENABLED" defaultValue={String(runtime.playbook_supervisor_enabled ?? "false")} placeholder="PLAYBOOK_SUPERVISOR_ENABLED" />
-        <input name="PLAYBOOK_REQUIRE_HUMAN_CONFIRM" defaultValue={String(runtime.playbook_require_human_confirm ?? "true")} placeholder="PLAYBOOK_REQUIRE_HUMAN_CONFIRM" />
-        <input name="PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH" defaultValue={String(runtime.playbook_supervisor_system_prompt_path || "app/agents/prompts/playbook_supervisor.md")} placeholder="PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH" />
-        <button type="submit"><Save size={16} /> Save Settings</button>
+        <SettingsField
+          name="ALLOWED_GIT_HOSTS"
+          label="Allowed Git hosts"
+          description="Comma-separated hostnames permitted for remote clone URLs (e.g. github.com, gitlab.com)."
+          defaultValue={runtimeSettingValue(runtime, "allowed_git_hosts")}
+          placeholder="github.com"
+          fullWidth
+        />
+        <SettingsField
+          name="ALLOWED_SOURCE_REPO_ROOTS"
+          label="Allowed local repo roots"
+          description="Comma-separated filesystem paths permitted for local source checkouts."
+          defaultValue={runtimeSettingValue(runtime, "allowed_source_repo_roots")}
+          placeholder="/Users/you/repos"
+          fullWidth
+        />
+        <SettingsField
+          name="GIT_AUTHOR_NAME"
+          label="Git commit author name"
+          description="Author name used on automated git commits."
+          defaultValue={runtimeSettingValue(runtime, "git_author_name")}
+        />
+        <SettingsField
+          name="GIT_AUTHOR_EMAIL"
+          label="Git commit author email"
+          description="Author email used on automated git commits."
+          defaultValue={runtimeSettingValue(runtime, "git_author_email")}
+        />
+
+        <h3 className="settings-section-title">Paths & logging</h3>
+        <SettingsField
+          name="WORKSPACE_ROOT"
+          label="Run workspaces"
+          description="Directory where per-run sandboxes are created."
+          defaultValue={runtimeSettingValue(runtime, "workspace_root")}
+          placeholder="./workspace"
+        />
+        <SettingsField
+          name="BACKUP_ROOT"
+          label="Backups"
+          description="Directory for backup manifests and restore data."
+          defaultValue={runtimeSettingValue(runtime, "backup_root")}
+          placeholder="./backups"
+        />
+        <SettingsField
+          name="LOG_LEVEL"
+          label="Log level"
+          description="Python logging verbosity: DEBUG, INFO, WARNING, ERROR."
+          defaultValue={runtimeSettingValue(runtime, "log_level", "INFO")}
+          placeholder="INFO"
+        />
+
+        <h3 className="settings-section-title">Pipeline features</h3>
+        <SettingsField
+          name="USE_SCOUT_STAGE"
+          label="Scout stage"
+          description="When true, the planner receives a read-only file-tree preamble before planning."
+          defaultValue={runtimeSettingValue(runtime, "use_scout_stage", "false")}
+          placeholder="false"
+        />
+        <SettingsField
+          name="PLAYBOOK_SUPERVISOR_ENABLED"
+          label="Playbook supervisor"
+          description="Enable playbook overlay and the supervisor agent."
+          defaultValue={runtimeSettingValue(runtime, "playbook_supervisor_enabled", "false")}
+          placeholder="false"
+        />
+        <SettingsField
+          name="PLAYBOOK_REQUIRE_HUMAN_CONFIRM"
+          label="Human confirm for playbooks"
+          description="When true, playbook changes require operator confirmation."
+          defaultValue={runtimeSettingValue(runtime, "playbook_require_human_confirm", "true")}
+          placeholder="true"
+        />
+        <SettingsField
+          name="PLAYBOOK_SUPERVISOR_SYSTEM_PROMPT_PATH"
+          label="Supervisor prompt path"
+          description="Path to the playbook supervisor system prompt markdown file."
+          defaultValue={runtimeSettingValue(
+            runtime,
+            "playbook_supervisor_system_prompt_path",
+            "app/agents/prompts/playbook_supervisor.md"
+          )}
+          fullWidth
+        />
+
+        <div className="settings-field settings-field-full">
+          <button type="submit"><Save size={16} /> Save Settings</button>
+          <p className="field-hint">Writes to .env. Restart the server for some changes to take effect.</p>
+        </div>
       </form>
+      </div>
     </section>
   );
 }
@@ -1618,7 +1918,7 @@ function RunView(props: {
       </section>
 
       <section className="detail-grid">
-        <PanelList title="Timeline" icon={<History />} items={events.map((item) => [item.event_type, item.message])} />
+        <TimelinePanel events={events} />
         <PanelList title="State Snapshots" icon={<Activity />} items={snapshots.slice(-8).reverse().map((item) => [`${item.stage} / ${item.status}`, `retry_count=${item.retry_count}`])} />
       </section>
 
@@ -1686,6 +1986,69 @@ function PanelList({ title, icon, items }: { title: string; icon: React.ReactNod
           </div>
         ))}
       </div>
+    </section>
+  );
+}
+
+function TimelinePanel({ events }: { events: EventItem[] }) {
+  const [newestFirst, setNewestFirst] = useState(true);
+
+  const deduped = useMemo(() => {
+    const result: Array<EventItem & { count: number }> = [];
+    for (const evt of events) {
+      const last = result[result.length - 1];
+      if (last && last.event_type === evt.event_type && last.message === evt.message) {
+        last.count += 1;
+      } else {
+        result.push({ ...evt, count: 1 });
+      }
+    }
+    return newestFirst ? [...result].reverse() : result;
+  }, [events, newestFirst]);
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Timeline</h2>
+        <div className="timeline-controls">
+          <button
+            type="button"
+            className={`timeline-sort-btn${newestFirst ? " active" : ""}`}
+            onClick={() => setNewestFirst(true)}
+          >
+            Newest
+          </button>
+          <button
+            type="button"
+            className={`timeline-sort-btn${!newestFirst ? " active" : ""}`}
+            onClick={() => setNewestFirst(false)}
+          >
+            Oldest
+          </button>
+          <History size={16} />
+        </div>
+      </div>
+      {deduped.length === 0 ? (
+        <div className="empty">No events yet.</div>
+      ) : (
+        <ol className="timeline">
+          {deduped.map((evt) => (
+            <li key={evt.id} className="timeline-item">
+              <div className="timeline-dot" />
+              <div className="timeline-body">
+                <div className="timeline-header">
+                  <strong>{humanizeSnake(evt.event_type)}</strong>
+                  <div className="timeline-meta">
+                    {evt.count > 1 && <span className="timeline-badge">×{evt.count}</span>}
+                    <time className="timeline-time">{formatEventTime(evt.created_at)}</time>
+                  </div>
+                </div>
+                {evt.message && <p className="timeline-msg">{evt.message}</p>}
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
     </section>
   );
 }

@@ -5,6 +5,7 @@ import ast
 import json
 import logging
 import queue
+import re
 import shlex
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, cast
 
@@ -22,7 +24,14 @@ from app.core.enums import ArtifactType, ProviderStatus, RunStage, RunStatus, St
 from app.core.exceptions import ConfigurationError, ProviderError, WorkflowError
 from app.core.request_context import set_request_id, set_run_id
 from app.core.settings import get_settings
-from app.db.models import ArtifactModel, RunEventModel, RunModel, RunStateSnapshotModel, TaskModel
+from app.db.models import (
+    ArtifactModel,
+    RunEventModel,
+    RunModel,
+    RunStateSnapshotModel,
+    TaskModel,
+    utc_now,
+)
 from app.db.session import get_session_factory
 from app.graph.state import WorkflowState
 from app.providers.registry import get_provider, resolve_provider
@@ -52,6 +61,7 @@ logger = logging.getLogger(__name__)
 MAX_REVIEW_RETRIES = 3
 MAX_TEST_RETRIES = 3
 MAX_TOTAL_RETRIES = 5
+RUNNING_RECOVERY_STALE_AFTER_SECONDS = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -118,10 +128,8 @@ STAGES: list[StageDefinition] = [
             "line_changes, and file_changes for this task. Prefer line_changes for small "
             "line-level edits. line_changes objects must contain path, operation, anchor, "
             "content, and optional occurrence. Use file_changes only for whole-file upsert/delete "
-            "edits that are truly necessary. Preserve existing "
-            "FastAPI APIRouter route paths, function names, imports, auth/session behavior, "
-            "redirects, and UI flows unless explicitly requested otherwise. Do not replace "
-            "app/ui/routes.py with a standalone FastAPI app:\n\n{request_text}"
+            "edits that are truly necessary. Follow repository-specific constraints in the "
+            "prompt body:\n\n{request_text}"
         ),
     ),
     StageDefinition(
@@ -201,6 +209,7 @@ class OrchestrationService:
     def _recover_interrupted_runs(self) -> list[str]:
         session = get_session_factory()()
         try:
+            now = utc_now()
             interrupted_runs = session.scalars(
                 select(RunModel).where(RunModel.status.in_([RunStatus.RUNNING, "queued"]))
             ).all()
@@ -210,6 +219,16 @@ class OrchestrationService:
 
             for run in interrupted_runs:
                 previous_status = str(run.status)
+                if previous_status == RunStatus.RUNNING and not self._is_run_stale_for_recovery(
+                    run,
+                    now,
+                ):
+                    logger.info(
+                        "Leaving recently updated running run untouched during startup "
+                        "recovery: %s",
+                        run.id,
+                    )
+                    continue
                 run.status = RunStatus.FAILED
                 run.error_message = (
                     "Run was recovered from an interrupted or legacy worker state. Retry it from "
@@ -235,6 +254,13 @@ class OrchestrationService:
             return [run.id for run in pending_runs]
         finally:
             session.close()
+
+    def _is_run_stale_for_recovery(self, run: RunModel, now: datetime) -> bool:
+        updated_at = run.updated_at
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        cutoff = now - timedelta(seconds=RUNNING_RECOVERY_STALE_AFTER_SECONDS)
+        return updated_at <= cutoff
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -425,7 +451,16 @@ class OrchestrationService:
                 except PatchGuardError as exc:
                     test_retries += 1
                     total_retries += 1
-                    retry_feedback = [str(exc)]
+                    guard_hint = self._patch_guard_fix_hint(str(exc))
+                    retry_feedback = [str(exc), guard_hint]
+                    failed_context = self._patch_guard_anchor_context(run.id, str(exc))
+                    if failed_context:
+                        retry_feedback.extend(
+                            [
+                                "Exact current file lines for the rejected patch target:",
+                                failed_context,
+                            ]
+                        )
                     run.retry_count = total_retries
                     workflow_state["retry_count"] = total_retries
                     workflow_state["errors"] = retry_feedback
@@ -460,7 +495,12 @@ class OrchestrationService:
                     run.status = RunStatus.RUNNING
                     continue
 
-                review_prompt = self._build_review_request(task.request_text, retry_feedback)
+                review_prompt = self._build_review_request(
+                    task.request_text,
+                    retry_feedback,
+                    run.id,
+                    code_model,
+                )
                 review_model = cast(
                     ReviewResponse,
                     self._run_stage_with_provider_retries(
@@ -512,7 +552,7 @@ class OrchestrationService:
                     run.status = RunStatus.RUNNING
                     continue
 
-                test_prompt = self._build_test_request(task.request_text, retry_feedback)
+                test_prompt = self._build_test_request(task.request_text, retry_feedback, run.id)
                 test_model = cast(
                     TestResultResponse,
                     self._run_stage_with_provider_retries(
@@ -621,6 +661,26 @@ class OrchestrationService:
         return (
             "Scout: repository file tree (read-only, truncated). Use it to orient the plan.\n"
             f"{lines}"
+        )
+
+    def _run_workspace_is_platform_console(self, run_id: str) -> bool:
+        """True when the workspace is this platform's FastAPI + operator UI checkout."""
+        return (get_run_workspace_path(run_id) / "app" / "ui" / "routes.py").is_file()
+
+    def _coder_workspace_file_manifest(self, run_id: str, *, limit: int = 200) -> str:
+        snapshot = list_run_workspace_files(run_id)
+        files = snapshot.get("files") if isinstance(snapshot, dict) else []
+        if not isinstance(files, list):
+            files = []
+        trimmed = [str(f) for f in files[:limit]]
+        lines = "\n".join(f"- {path}" for path in trimmed)
+        omitted = len(files) - limit
+        suffix = f"\n... ({omitted} additional paths omitted)" if omitted > 0 else ""
+        return (
+            "Workspace file index (truncated). For line_changes, each `path` must be a "
+            "relative path to an existing file listed here; `anchor` must match an exact "
+            "single line from that file. Do not invent directories or stacks not present "
+            f"in this list.\n{lines}{suffix}"
         )
 
     def _run_stage(
@@ -956,6 +1016,53 @@ class OrchestrationService:
                     "explicit delete/remove request."
                 )
 
+    def _patch_guard_fix_hint(self, error_message: str) -> str:
+        msg = error_message.lower()
+        if "anchor was not found" in msg or "occurrence" in msg:
+            return (
+                "Fix: the anchor line you specified does not exist in the file — it may "
+                "have been modified by an earlier patch in this retry loop. Read the "
+                "'Target file anchor context' section in this prompt carefully: every "
+                "anchor must be copied verbatim from those numbered lines. If the line "
+                "you need to change is no longer present, switch to a file_changes upsert "
+                "with the complete corrected file content instead of using line_changes."
+            )
+        if "line-level patch" in msg and ("routes.py" in msg or "render.py" in msg):
+            return (
+                "Fix: remove ALL line_changes entries for app/ui/routes.py and "
+                "app/ui/render.py — these files are HARD-BLOCKED from line_changes. "
+                "Use file_changes (change_type=upsert) only, and preserve every existing "
+                "route decorator, path, function name, and parameter exactly."
+            )
+        if "route signature" in msg or "route decorators" in msg or "route contract" in msg:
+            return (
+                "Fix: your file_changes upsert for app/ui/routes.py changed route "
+                "signatures. You MUST copy the exact route contract from the "
+                "'Existing app/ui/routes.py route contract' section verbatim — same "
+                "decorator, path, function name, and parameter list for every route. "
+                "Only change code inside the function bodies."
+            )
+        if "render.py public helper" in msg or "render contract" in msg:
+            return (
+                "Fix: your file_changes upsert for app/ui/render.py removed or renamed "
+                "a required helper. Preserve the exact def signatures for layout, page, "
+                "page_with_auto_refresh, and status_badge shown in the render contract."
+            )
+        if "outside task target_files" in msg:
+            return (
+                "Fix: remove any line_changes or file_changes whose path is not in the "
+                "task target_files allowlist shown in the prompt."
+            )
+        if "documentation intent" in msg or "too large" in msg:
+            return (
+                "Fix: this is a documentation-only task — keep the patch to a few lines. "
+                "Use line_changes with a single insert or replace operation."
+            )
+        return (
+            "Fix: review the guard error above, remove the offending change, and resubmit "
+            "a patch that stays within the constraints listed in the prompt."
+        )
+
     def _line_delta_counts(
         self,
         original_lines: list[str],
@@ -1228,12 +1335,36 @@ class OrchestrationService:
 
     def _validation_commands(self, commands: list[str], workspace_path: Path) -> list[list[str]]:
         parsed = [shlex.split(command) for command in commands if command.strip()]
+        package_commands = self._package_validation_commands(workspace_path)
+        if package_commands:
+            npm_commands = [command for command in parsed if command[:2] == ["npm", "run"]]
+            return npm_commands or package_commands
         if parsed:
             return parsed
 
         if (workspace_path / "pyproject.toml").exists():
             return [["ruff", "check", "."], ["mypy", "app"], ["pytest", "-q"]]
         return []
+
+    def _package_validation_commands(self, workspace_path: Path) -> list[list[str]]:
+        package_path = workspace_path / "package.json"
+        if not package_path.exists():
+            return []
+        try:
+            package_data = json.loads(package_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return []
+        scripts = package_data.get("scripts")
+        if not isinstance(scripts, dict):
+            return []
+
+        commands: list[list[str]] = []
+        for script in ("typecheck", "test"):
+            if script in scripts:
+                commands.append(["npm", "run", script])
+        if not commands and "lint" in scripts:
+            commands.append(["npm", "run", "lint"])
+        return commands
 
     def _command_result_payload(self, result: CommandResult) -> dict[str, object]:
         return {
@@ -1421,23 +1552,56 @@ class OrchestrationService:
         ui_design_model: UIDesignResponse,
         retry_feedback: list[str],
     ) -> str:
-        sections = [
-            request_text,
-            "\nCoder hard constraints:",
-            "- Preserve existing FastAPI APIRouter setup, route paths, route function names, "
-            "imports, form parameters, redirects, auth/session checks, and API/service calls.",
-            "- Do not create a standalone FastAPI() app in app/ui/routes.py.",
-            "- Do not remove existing UI flows: login, dashboard, repository, provider, "
-            "settings, backups, run detail, run actions, workspace diff, workspace editor, "
-            "and backup restore rehearsal.",
-            "- Keep changes scoped to existing UI rendering and styling unless a route-level "
-            "change is strictly necessary.",
-            "- If app/ui/render.py is in target_files, implement the visual redesign there first "
-            "and do not edit app/ui/routes.py unless the requested behavior cannot work without "
-            "it.",
-            "- Return valid JSON only. Do not include Markdown fences, prose outside JSON, or "
-            "comments.",
-        ]
+        platform_console = self._run_workspace_is_platform_console(run_id)
+        sections: list[str] = [request_text]
+        if platform_console:
+            sections.extend(
+                [
+                    "\nCoder hard constraints (AI Dev Platform operator console):",
+                    "- NEVER use line_changes on app/ui/routes.py or app/ui/render.py — these "
+                    "files are protected. Use file_changes (upsert) only for those two paths.",
+                    "- When writing a file_changes upsert for app/ui/routes.py, keep every "
+                    "existing route decorator, path, function name, and parameter list identical "
+                    "to the route contract listed below.",
+                    "- When writing a file_changes upsert for app/ui/render.py, keep the "
+                    "signatures of layout, page, page_with_auto_refresh, and status_badge "
+                    "identical to the render contract listed below.",
+                    "- Preserve existing FastAPI APIRouter setup, route paths, route function "
+                    "names, imports, form parameters, redirects, auth/session checks, and "
+                    "API/service calls.",
+                    "- Do not create a standalone FastAPI() app in app/ui/routes.py.",
+                    "- Do not remove existing UI flows: login, dashboard, repository, provider, "
+                    "settings, backups, run detail, run actions, workspace diff, workspace "
+                    "editor, and backup restore rehearsal.",
+                    "- Keep changes scoped to existing UI rendering and styling unless a "
+                    "route-level change is strictly necessary.",
+                    "- If app/ui/render.py is in target_files, implement the visual redesign "
+                    "there first and do not edit app/ui/routes.py unless the requested behavior "
+                    "cannot work without it.",
+                    "- Return valid JSON only. Do not include Markdown fences, prose outside "
+                    "JSON, or comments.",
+                ]
+            )
+        else:
+            sections.extend(
+                [
+                    "\nCoder hard constraints (cloned application repository):",
+                    "- This workspace is the task's checked-out source tree (may be Next.js, "
+                    "Python, etc.). Ignore any prior assumptions about FastAPI app/ui/routes.py "
+                    "unless that path exists in the file index below.",
+                    "- Every line_changes entry must use a `path` for a file that already "
+                    "exists; `anchor` must be an exact single line from that file.",
+                    "- Do not invent modules or paths (for example fabricated src/core/*.py) "
+                    "that are not in the file index.",
+                    "- Use file_changes upsert only for genuinely new files; line_changes "
+                    "require existing targets.",
+                    "- Align touched_modules and plans with the real stack implied by paths "
+                    "below (e.g. .tsx/.ts under app/ or components/).",
+                    "- Return valid JSON only. Do not include Markdown fences, prose outside "
+                    "JSON, or comments.",
+                    "\n" + self._coder_workspace_file_manifest(run_id),
+                ]
+            )
         if target_files:
             sections.extend(
                 [
@@ -1447,6 +1611,13 @@ class OrchestrationService:
                 ]
             )
         target_file_context = self._target_file_anchor_context(run_id, target_files)
+        if not target_file_context and not platform_console:
+            target_file_context = self._architect_existing_file_context(
+                run_id,
+                architect_model,
+            )
+        if not target_file_context and not platform_console:
+            target_file_context = self._cloned_workspace_source_context(run_id)
         if target_file_context:
             sections.extend(
                 [
@@ -1458,7 +1629,15 @@ class OrchestrationService:
             )
         route_contract = self._route_contract_prompt(run_id)
         if route_contract:
-            sections.extend(["\nExisting app/ui/routes.py route contract:", route_contract])
+            sections.extend(
+                [
+                    "\nExisting app/ui/routes.py route contract (DO NOT CHANGE these signatures):",
+                    route_contract,
+                    "Every route above must appear in your output with the identical decorator, "
+                    "path, function name, and parameters. Changing any of them will cause a "
+                    "PatchGuardError and force a retry.",
+                ]
+            )
         render_contract = self._render_contract_prompt(run_id)
         if render_contract:
             sections.extend(
@@ -1466,16 +1645,31 @@ class OrchestrationService:
             )
         if retry_feedback:
             sections.extend(["\nRetry feedback:", *[f"- {item}" for item in retry_feedback]])
+        if platform_console:
+            sections.extend(
+                [
+                    "\nImplementation guidance:",
+                    "- For visual redesign tasks, prefer app/ui/render.py edits and existing "
+                    "CSS/HTML helpers.",
+                    "- Avoid editing app/ui/routes.py unless the exact route contract above is "
+                    "preserved.",
+                    "- If a guard rejected a previous route edit, remove the route edit and make "
+                    "the visual change in app/ui/render.py instead.",
+                    "- Before returning JSON, mentally check Python string quoting for embedded "
+                    "HTML.",
+                ]
+            )
+        else:
+            sections.extend(
+                [
+                    "\nImplementation guidance:",
+                    "- Reconcile architect/UI notes with the actual repository layout in the file "
+                    "index; drop or rewrite any plan items that reference files not in the index.",
+                    "- Prefer minimal edits to real source files over speculative new layers.",
+                ]
+            )
         sections.extend(
             [
-                "\nImplementation guidance:",
-                "- For visual redesign tasks, prefer app/ui/render.py edits and existing CSS/HTML "
-                "helpers.",
-                "- Avoid editing app/ui/routes.py unless the exact route contract above is "
-                "preserved.",
-                "- If a guard rejected a previous route edit, remove the route edit and make the "
-                "visual change in app/ui/render.py instead.",
-                "- Before returning JSON, mentally check Python string quoting for embedded HTML.",
                 "\nPlanner summary:",
                 planner_model.summary,
                 "\nPlanner acceptance criteria:",
@@ -1494,15 +1688,94 @@ class OrchestrationService:
         return [f"- {value}" for value in values[:8]]
 
     def _target_file_anchor_context(self, run_id: str, target_files: list[str]) -> str:
-        if not target_files:
-            return ""
+        return self._anchor_context_for_paths(run_id, target_files)
 
+    def _architect_existing_file_context(
+        self,
+        run_id: str,
+        architect_model: ArchitectureResponse,
+    ) -> str:
+        candidates: list[str] = []
+        for value in [*architect_model.touched_modules, *architect_model.file_change_plan]:
+            candidates.extend(self._extract_repo_paths(value))
+        return self._anchor_context_for_paths(run_id, candidates, limit=6)
+
+    def _cloned_workspace_source_context(self, run_id: str) -> str:
+        snapshot = list_run_workspace_files(run_id)
+        files = snapshot.get("files") if isinstance(snapshot, dict) else []
+        if not isinstance(files, list):
+            return ""
+        source_exts = (".ts", ".tsx", ".js", ".jsx", ".py")
+        ignored_parts = {
+            ".git",
+            ".next",
+            "node_modules",
+            "dist",
+            "build",
+            "coverage",
+            "__pycache__",
+        }
+        candidates = [
+            str(path)
+            for path in files
+            if str(path).endswith(source_exts)
+            and not any(part in ignored_parts for part in Path(str(path)).parts)
+        ]
+
+        def rank(path: str) -> tuple[int, int, str]:
+            if path.startswith("app/api/"):
+                priority = 0
+            elif path.startswith("lib/") or path.startswith("src/"):
+                priority = 1
+            elif path.startswith("app/"):
+                priority = 2
+            elif path.startswith("components/"):
+                priority = 3
+            elif path.startswith("tests/") or path.startswith("__tests__/"):
+                priority = 4
+            else:
+                priority = 5
+            return (priority, path.count("/"), path)
+
+        return self._anchor_context_for_paths(run_id, sorted(candidates, key=rank), limit=8)
+
+    def _patch_guard_anchor_context(self, run_id: str, error_message: str) -> str:
+        paths = self._extract_repo_paths(error_message)
+        return self._anchor_context_for_paths(run_id, paths, limit=1)
+
+    def _extract_repo_paths(self, value: str) -> list[str]:
+        matches = re.findall(
+            r"[\w@().\-/\[\]]+\.(?:py|pyi|ts|tsx|js|jsx|json|md|css|scss|html|yml|yaml)",
+            value,
+        )
+        out: list[str] = []
+        for match in matches:
+            normalized = match.strip().strip("`'\".,:;()").lstrip("/")
+            if not normalized or normalized.startswith("..") or ".git" in Path(normalized).parts:
+                continue
+            if normalized not in out:
+                out.append(normalized)
+        return out
+
+    def _anchor_context_for_paths(
+        self,
+        run_id: str,
+        paths: list[str],
+        *,
+        limit: int = 5,
+    ) -> str:
+        if not paths:
+            return ""
         workspace_path = get_run_workspace_path(run_id)
         context_blocks: list[str] = []
-        for raw_path in target_files[:5]:
+        seen: set[str] = set()
+        for raw_path in paths:
+            if len(context_blocks) >= limit:
+                break
             normalized_path = raw_path.strip().lstrip("/")
-            if normalized_path.endswith("/"):
+            if not normalized_path or normalized_path in seen or normalized_path.endswith("/"):
                 continue
+            seen.add(normalized_path)
             file_path = workspace_path / normalized_path
             if not file_path.exists() or not file_path.is_file():
                 continue
@@ -1545,30 +1818,61 @@ class OrchestrationService:
             return ""
         return "\n".join(f"- def {name}({args})" for name, args in sorted(signatures.items()))
 
-    def _build_review_request(self, request_text: str, retry_feedback: list[str]) -> str:
-        if not retry_feedback:
-            return request_text
+    def _workspace_diff_context(self, run_id: str, *, max_chars: int = 12000) -> str:
+        diff = get_run_workspace_diff(run_id)
+        if not bool(diff.get("has_changes")):
+            return "Workspace diff: no files changed."
+        diff_text = str(diff.get("diff_text") or "")
+        if len(diff_text) > max_chars:
+            diff_text = diff_text[:max_chars] + "\n... diff truncated ..."
+        changed_files = diff.get("changed_files") or []
         return "\n".join(
-            [request_text, "Focus review on prior issues being resolved:", *retry_feedback]
+            [
+                "Workspace diff for current proposed patch:",
+                "Changed files:",
+                *[f"- {path}" for path in changed_files],
+                "",
+                diff_text,
+            ]
         )
 
-    def _build_test_request(self, request_text: str, retry_feedback: list[str]) -> str:
+    def _build_review_request(
+        self,
+        request_text: str,
+        retry_feedback: list[str],
+        run_id: str,
+        code_model: CodeChangeResponse,
+    ) -> str:
+        sections = [
+            request_text,
+            "Review the actual proposed code change below. Do not claim the repository is "
+            "inaccessible; the changed files and workspace diff are included in this prompt.",
+            "Coder proposed changed files:",
+            *[f"- {path}" for path in code_model.changed_files],
+            "Coder implementation notes:",
+            *[f"- {note}" for note in code_model.implementation_notes],
+            self._workspace_diff_context(run_id),
+        ]
+        if retry_feedback:
+            sections.extend(["Focus review on prior issues being resolved:", *retry_feedback])
+        return "\n".join(sections)
+
+    def _build_test_request(
+        self,
+        request_text: str,
+        retry_feedback: list[str],
+        run_id: str,
+    ) -> str:
         whitelist_note = (
             "Validation command whitelist: commands may only be one of 'ruff check .', "
             "'mypy app', 'pytest -q', 'pytest tests -q', or 'pytest <test-path> -q'. "
             "Do not put grep, find, test, python -c, shell pipelines, redirects, bash, sh, "
             "awk, sed, or curl in commands."
         )
-        if not retry_feedback:
-            return "\n".join([request_text, whitelist_note])
-        return "\n".join(
-            [
-                request_text,
-                whitelist_note,
-                "Focus validation on prior failures being resolved:",
-                *retry_feedback,
-            ]
-        )
+        sections = [request_text, whitelist_note, self._workspace_diff_context(run_id)]
+        if retry_feedback:
+            sections.extend(["Focus validation on prior failures being resolved:", *retry_feedback])
+        return "\n".join(sections)
 
     def _invoke_stage(
         self,

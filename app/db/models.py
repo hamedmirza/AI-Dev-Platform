@@ -43,6 +43,122 @@ class TaskModel(Base):
         return _decode_json_list(self.target_files_json)
 
 
+class ProjectModel(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    name: Mapped[str] = mapped_column(String(255))
+    slug: Mapped[str] = mapped_column(String(255), index=True)
+    initial_requirements: Mapped[str] = mapped_column(Text)
+    source_repo_spec: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    repo_key: Mapped[str] = mapped_column(String(64), index=True, default="global")
+    status: Mapped[str] = mapped_column(String(64), index=True, default="intake")
+    app_type: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    target_stack_json: Mapped[str] = mapped_column(Text, default="{}")
+    validation_profile: Mapped[str] = mapped_column(String(128), default="python")
+    readiness_score: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    messages: Mapped[list["ProjectMessageModel"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+    questions: Mapped[list["ProjectQuestionModel"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+    build_items: Mapped[list["ProjectBuildItemModel"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+
+
+class SavedSourceRepoModel(Base):
+    __tablename__ = "saved_source_repos"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    label: Mapped[str] = mapped_column(String(255))
+    source_repo_spec: Mapped[str] = mapped_column(Text)
+    repo_key: Mapped[str] = mapped_column(String(64), index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+
+class ProjectMessageModel(Base):
+    __tablename__ = "project_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    role: Mapped[str] = mapped_column(String(32))
+    message_type: Mapped[str] = mapped_column(String(64), index=True)
+    content: Mapped[str] = mapped_column(Text)
+    structured_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    project: Mapped[ProjectModel] = relationship(back_populates="messages")
+
+
+class ProjectQuestionModel(Base):
+    __tablename__ = "project_questions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    key: Mapped[str] = mapped_column(String(64), index=True)
+    question: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)
+    answer_type: Mapped[str] = mapped_column(String(64), default="text")
+    options_json: Mapped[str] = mapped_column(Text, default="[]")
+    status: Mapped[str] = mapped_column(String(32), index=True, default="open")
+    answer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    answered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped[ProjectModel] = relationship(back_populates="questions")
+
+
+class ProjectBuildItemModel(Base):
+    __tablename__ = "project_build_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    parent_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    title: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(Text)
+    item_type: Mapped[str] = mapped_column(String(64), default="task")
+    status: Mapped[str] = mapped_column(String(64), index=True, default="draft")
+    target_files_json: Mapped[str] = mapped_column(Text, default="[]")
+    depends_on_json: Mapped[str] = mapped_column(Text, default="[]")
+    assigned_role: Mapped[str] = mapped_column(String(64), default="coder")
+    run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    project: Mapped[ProjectModel] = relationship(back_populates="build_items")
+
+    @property
+    def target_files(self) -> list[str]:
+        return _decode_json_list(self.target_files_json)
+
+    @property
+    def depends_on(self) -> list[str]:
+        return _decode_json_list(self.depends_on_json)
+
+
 class RunModel(Base):
     __tablename__ = "runs"
 

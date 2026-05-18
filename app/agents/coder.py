@@ -9,8 +9,8 @@ class CoderAgent(BaseAgent):
             "Return JSON with changed_files, implementation_notes, requires_operator_approval, "
             "line_changes, and file_changes. Prefer line_changes for small edits; each item "
             "must contain path, operation, anchor, content, and optional occurrence. Use "
-            "file_changes only for whole-file upsert/delete edits. Preserve existing FastAPI "
-            "APIRouter routes, route signatures, imports, auth/session behavior, redirects, "
-            f"and UI flows unless explicitly asked to change them:\n\n{request_text}"
+            "file_changes only for whole-file upsert/delete edits. Follow repository-specific "
+            "constraints in the prompt (console FastAPI UI vs cloned app):\n\n"
+            f"{request_text}"
         )
         return self.run(user_prompt, CodeChangeResponse)

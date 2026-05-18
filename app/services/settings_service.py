@@ -38,6 +38,18 @@ EDITABLE_ENV_KEYS = {
     "REPO_LESSON_MAX_LINES",
 }
 
+POSITIVE_INT_ENV_KEYS = {
+    "APP_PORT",
+    "WORKER_COUNT",
+    "PLAYBOOK_CHAR_LIMIT",
+    "REPO_LESSON_MAX_LINES",
+}
+
+POSITIVE_FLOAT_ENV_KEYS = {
+    "PROVIDER_TIMEOUT_SECONDS",
+    "GIT_CLONE_TIMEOUT_SECONDS",
+}
+
 
 def _env_path() -> Path:
     configured = os.environ.get("APP_SETTINGS_FILE")
@@ -67,7 +79,32 @@ def save_local_settings(updates: dict[str, str]) -> None:
         if key in EDITABLE_ENV_KEYS:
             current[key] = value
 
+    _validate_local_settings(current)
     lines = [f"{key}={current[key]}" for key in sorted(current)]
     _env_path().write_text("\n".join(lines) + "\n", encoding="utf-8")
     clear_settings_cache()
     get_settings()
+
+
+def _validate_local_settings(values: dict[str, str]) -> None:
+    for key in POSITIVE_INT_ENV_KEYS:
+        raw_value = values.get(key)
+        if raw_value is None or raw_value == "":
+            continue
+        try:
+            parsed = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"{key} must be an integer.") from exc
+        if parsed <= 0:
+            raise ValueError(f"{key} must be greater than zero.")
+
+    for key in POSITIVE_FLOAT_ENV_KEYS:
+        raw_value = values.get(key)
+        if raw_value is None or raw_value == "":
+            continue
+        try:
+            parsed = float(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"{key} must be a number.") from exc
+        if parsed <= 0:
+            raise ValueError(f"{key} must be greater than zero.")
