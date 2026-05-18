@@ -25,6 +25,8 @@ def create_task_and_run(session: Session, payload: TaskCreate, provider_name: st
         source_repo_spec=payload.source_repo,
         use_scout=payload.use_scout,
         stage_models_json=stage_models_json,
+        validation_profile=payload.validation_profile,
+        validation_commands_json=json.dumps(payload.validation_commands),
     )
     session.add(task)
     session.flush()
@@ -35,6 +37,7 @@ def create_task_and_run(session: Session, payload: TaskCreate, provider_name: st
         current_stage=RunStage.INTAKE,
         provider_name=provider_name,
         request_id=request_id,
+        validation_profile=payload.validation_profile,
     )
     session.add(run)
     session.flush()

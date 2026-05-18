@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.routes.config import require_api_token
+from app.core.settings import get_settings
 from app.db.session import get_db
 from app.schemas.project import (
     ProjectCommandResponse,
@@ -56,8 +57,9 @@ def projects_message(
         project, run_ids = add_project_message(session, project_id, payload.content)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    for run_id in run_ids:
-        get_orchestration_service().enqueue_run(run_id)
+    if not get_settings().safe_mode:
+        for run_id in run_ids:
+            get_orchestration_service().enqueue_run(run_id)
     return ProjectCommandResponse(
         project=project,
         message="Message processed.",
@@ -103,8 +105,9 @@ def projects_start_build(
         project, run_ids = start_project_build(session, project_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    for run_id in run_ids:
-        get_orchestration_service().enqueue_run(run_id)
+    if not get_settings().safe_mode:
+        for run_id in run_ids:
+            get_orchestration_service().enqueue_run(run_id)
     return ProjectCommandResponse(
         project=project,
         message="Build start command processed.",

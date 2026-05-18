@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ProjectCreate(BaseModel):
@@ -9,7 +9,23 @@ class ProjectCreate(BaseModel):
     initial_requirements: str = Field(min_length=10)
     source_repo: Optional[str] = None
     app_type: Optional[str] = None
-    validation_profile: str = "python"
+    validation_profile: str = "auto"
+    validation_commands: list[str] = Field(default_factory=list)
+
+    @field_validator("validation_profile")
+    @classmethod
+    def validate_validation_profile(cls, value: str) -> str:
+        profile = (value or "auto").strip().lower()
+        if profile not in {"auto", "python", "react-vite", "full-stack", "custom"}:
+            raise ValueError(
+                "validation_profile must be one of auto, python, react-vite, full-stack, custom."
+            )
+        return profile
+
+    @field_validator("validation_commands")
+    @classmethod
+    def validate_validation_commands(cls, value: list[str]) -> list[str]:
+        return [item.strip() for item in value if item.strip()]
 
 
 class ProjectMessageCreate(BaseModel):

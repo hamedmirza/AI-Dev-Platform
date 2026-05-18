@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(_: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
+    settings.validate_production_safety()
     init_db()
     orchestration = get_orchestration_service()
     orchestration.start()

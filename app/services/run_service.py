@@ -10,6 +10,7 @@ from app.core.enums import RunStage, RunStatus
 from app.core.exceptions import WorkflowError
 from app.db.models import RunEventModel, RunModel, RunStateSnapshotModel, TaskModel
 from app.schemas.run import (
+    RunBlockerResponse,
     RunEventResponse,
     RunHistoryCleanupResponse,
     RunResponse,
@@ -20,6 +21,7 @@ from app.services.repository_service import (
     cleanup_run_workspace,
     commit_run_workspace,
     get_run_workspace_diff,
+    get_run_workspace_path,
 )
 
 
@@ -101,6 +103,13 @@ def approve_run(session: Session, run_id: str, note: Optional[str] = None) -> Ru
     if run.status != RunStatus.AWAITING_APPROVAL:
         raise WorkflowError("Run is not awaiting approval.")
 
+    workspace_path = get_run_workspace_path(run_id)
+    if not workspace_path.exists():
+        raise WorkflowError(
+            "Cannot approve: run workspace is missing on disk. Use Retry to recreate "
+            "the workspace from the task source repo before approving."
+        )
+
     diff = get_run_workspace_diff(run_id)
     if bool(diff["has_changes"]):
         commit_result = commit_run_workspace(run_id, f"run {run_id}: operator approved")
@@ -110,6 +119,13 @@ def approve_run(session: Session, run_id: str, note: Optional[str] = None) -> Ru
             "workspace_committed",
             "Workspace changes were committed during operator approval.",
             payload_json=str(commit_result["commit_sha"]),
+        )
+    else:
+        _record_event(
+            session,
+            run,
+            "workspace_no_changes_at_approval",
+            "Operator approved but the workspace contained no committable changes.",
         )
 
     run.status = RunStatus.COMPLETED
@@ -132,7 +148,10 @@ def reject_run(session: Session, run_id: str, note: Optional[str] = None) -> Run
 
     run.status = RunStatus.REVIEW_REQUIRED
     run.current_stage = RunStage.CODER
-    run.error_message = "Operator rejected the proposed change set."
+    run.error_message = (
+        "Operator rejected the proposed change set. The run is idle until you press "
+        "Retry, which starts a fresh planner pass from intake."
+    )
     _record_event(session, run, "operator_rejected", note or "Operator rejected the run.")
     _record_action_snapshot(session, run, "operator_rejected")
     session.commit()
@@ -182,6 +201,7 @@ def retry_run(session: Session, run_id: str, note: Optional[str] = None) -> RunR
     run.status = RunStatus.PENDING
     run.current_stage = RunStage.INTAKE
     run.error_message = None
+    run.active_blocker_json = None
     run.retry_count = 0
     _record_event(session, run, "operator_retried", note or "Operator retried the run.")
     _record_action_snapshot(session, run, "operator_retried")
@@ -191,7 +211,21 @@ def retry_run(session: Session, run_id: str, note: Optional[str] = None) -> RunR
     return result
 
 
-def cleanup_workspace(run_id: str) -> dict[str, object]:
+def cleanup_workspace(session: Session, run_id: str) -> dict[str, object]:
+    """Remove the on-disk workspace for ``run_id``.
+
+    Refuses while the run is still ``RUNNING`` so an active worker cannot have
+    its workspace deleted from underneath it (which would crash the stage and
+    corrupt artifacts mid-write). Operators must abort first and let the worker
+    reach a checkpoint before cleaning up.
+    """
+    run = session.get(RunModel, run_id)
+    if run is not None and run.status == RunStatus.RUNNING:
+        raise WorkflowError(
+            "Cannot clean up the workspace while the run is still running. "
+            "Abort the run first and wait for it to reach a terminal state "
+            "before retrying cleanup."
+        )
     return cleanup_run_workspace(run_id)
 
 
@@ -300,6 +334,7 @@ def _to_run_response(
     model: RunModel,
     latest_state_model: Optional[RunStateSnapshotModel],
 ) -> RunResponse:
+    active_blocker = _parse_blocker(getattr(model, "active_blocker_json", None))
     return RunResponse(
         id=model.id,
         task_id=model.task_id,
@@ -308,6 +343,8 @@ def _to_run_response(
         provider_name=model.provider_name,
         request_id=model.request_id,
         retry_count=model.retry_count,
+        validation_profile=getattr(model, "validation_profile", None) or "auto",
+        active_blocker=active_blocker,
         error_message=model.error_message,
         created_at=model.created_at,
         updated_at=model.updated_at,
@@ -324,11 +361,31 @@ def _to_run_response(
             provider_override=model.task.provider_override,
             model_override=model.task.model_override,
             request_text=model.task.request_text,
+            validation_profile=getattr(model.task, "validation_profile", None) or "auto",
             created_at=model.task.created_at,
             created_at_human=_humanize_datetime(model.task.created_at),
         ),
         latest_state=_to_snapshot_response(latest_state_model),
     )
+
+
+def _parse_blocker(raw: Optional[str]) -> Optional[RunBlockerResponse]:
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return RunBlockerResponse(type="unknown", message=raw, retry_eligible=True)
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return RunBlockerResponse.model_validate(payload)
+    except Exception:
+        return RunBlockerResponse(
+            type=str(payload.get("type") or "unknown"),
+            message=str(payload.get("message") or payload),
+            retry_eligible=bool(payload.get("retry_eligible", True)),
+        )
 
 
 def _humanize_datetime(value: datetime) -> str:

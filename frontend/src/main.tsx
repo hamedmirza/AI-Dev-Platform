@@ -43,8 +43,24 @@ type TaskSummary = {
   provider_override: string | null;
   model_override: string | null;
   request_text: string;
+  validation_profile: string;
   created_at: string;
   created_at_human: string;
+};
+
+type RunBlocker = {
+  type: string;
+  message: string;
+  command?: string | null;
+  failed_path?: string | null;
+  returncode?: number | null;
+  stdout_excerpt?: string | null;
+  stderr_excerpt?: string | null;
+  affected_files: string[];
+  retry_eligible: boolean;
+  suggested_retry_instruction?: string | null;
+  is_scope_mismatch: boolean;
+  profile?: string | null;
 };
 
 type RunSummary = {
@@ -55,6 +71,8 @@ type RunSummary = {
   provider_name: string;
   request_id: string | null;
   retry_count: number;
+  validation_profile: string;
+  active_blocker?: RunBlocker | null;
   error_message: string | null;
   created_at: string;
   updated_at: string;
@@ -116,6 +134,25 @@ type RunHistoryCleanupResponse = {
   message: string;
 };
 
+type RunActionApiResponse = {
+  run_id: string;
+  status: string;
+  message: string;
+};
+
+type CleanupWorkspaceResponse = {
+  run_id: string;
+  workspace_path: string;
+  removed: boolean;
+};
+
+const TERMINAL_RUN_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "blocked",
+]);
+
 type BackupItem = {
   name: string;
   path: string;
@@ -156,7 +193,9 @@ type ConfigSummary = {
   model_provider: string;
   backup_root: string;
   worker_count: number;
-  runtime?: Record<string, string | number>;
+  safe_mode?: boolean;
+  validation_profiles?: Record<string, string[]>;
+  runtime?: Record<string, string | number | boolean | string[] | Record<string, string[]>>;
   repository?: unknown;
   github?: unknown;
 };
@@ -322,6 +361,30 @@ function shortRunId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 8)}…` : id;
 }
 
+function parseArtifactContent<T>(artifact: Artifact | undefined): T | null {
+  if (!artifact) return null;
+  try {
+    return JSON.parse(artifact.content) as T;
+  } catch {
+    return null;
+  }
+}
+
+function latestArtifact(artifacts: Artifact[], type: string, titleIncludes?: string): Artifact | undefined {
+  return [...artifacts].reverse().find((artifact) => {
+    if (artifact.artifact_type !== type) return false;
+    return titleIncludes ? artifact.title.toLowerCase().includes(titleIncludes.toLowerCase()) : true;
+  });
+}
+
+function runOutcomeLabel(run: RunSummary): string {
+  if (run.status === "awaiting_approval") return "Ready for review";
+  if (run.status === "completed") return "Completed";
+  if (run.status === "blocked" || run.status === "failed") return "Needs attention";
+  if (run.status === "running" || run.status === "pending") return "In progress";
+  return humanizeSnake(run.status);
+}
+
 const nav = [
   { key: "dashboard", label: "Dashboard", href: "/ui", icon: LayoutDashboard },
   { key: "projects", label: "Projects", href: "/ui/projects", icon: FolderKanban },
@@ -359,6 +422,21 @@ function statusTone(value: string) {
   if (["failed", "cancelled", "blocked", "unavailable", "invalid"].some((item) => lower.includes(item))) return "bad";
   if (["await", "review", "pending", "queued", "degraded"].some((item) => lower.includes(item))) return "warn";
   return "ok";
+}
+
+function isSafeMode(config?: ConfigSummary): boolean {
+  return Boolean(config?.safe_mode || config?.runtime?.safe_mode);
+}
+
+function SafeModeBanner({ config }: { config?: ConfigSummary }) {
+  if (!isSafeMode(config)) return null;
+  return (
+    <div className="safe-mode-banner">
+      <Shield size={18} />
+      <strong>Safe mode active:</strong>
+      <span>autonomous retries disabled</span>
+    </div>
+  );
 }
 
 function App() {
@@ -559,6 +637,7 @@ function App() {
             projects={data.projects}
             sourceRepos={data.sourceRepos}
             project={project}
+            config={data.config}
             onNotice={setNotice}
             onError={setError}
             onRefresh={refreshAll}
@@ -634,6 +713,7 @@ function ProjectsView({
   projects,
   sourceRepos,
   project,
+  config,
   onNotice,
   onError,
   onRefresh,
@@ -642,6 +722,7 @@ function ProjectsView({
   projects: ProjectSummary[];
   sourceRepos: SavedSourceRepo[];
   project: ProjectDetail | null;
+  config?: ConfigSummary;
   onNotice: (message: string) => void;
   onError: (message: string) => void;
   onRefresh: () => Promise<void>;
@@ -697,7 +778,9 @@ function ProjectsView({
   };
 
   return (
-    <div className="project-workbench">
+    <div className="projects-view">
+      <SafeModeBanner config={config} />
+      <div className="project-workbench">
       <aside className="project-sidebar">
         <section className="panel">
           <div className="panel-head">
@@ -791,10 +874,10 @@ function ProjectsView({
               />
             ) : null}
             <select name="validation_profile" defaultValue="full-stack">
+              <option value="auto">Auto detect</option>
               <option value="python">Python</option>
-              <option value="frontend">Frontend</option>
+              <option value="react-vite">React/Vite</option>
               <option value="full-stack">Full-stack</option>
-              <option value="new-app">New app</option>
             </select>
             <textarea
               name="initial_requirements"
@@ -838,6 +921,7 @@ function ProjectsView({
           </p>
         </section>
       )}
+      </div>
     </div>
   );
 }
@@ -1125,6 +1209,7 @@ function Dashboard({
   };
   return (
     <div className="stack">
+      <SafeModeBanner config={data.config} />
       <section className="health-grid">
         <Metric icon={<Database />} label="API" value={data.health?.status || "unknown"} />
         <Metric icon={<Activity />} label="Provider" value={data.provider?.status || "unknown"} />
@@ -1530,6 +1615,13 @@ function SettingsView({ config, onNotice, onError }: { config?: ConfigSummary; o
           defaultValue={String(config?.worker_count ?? 3)}
           placeholder="3"
         />
+        <SettingsField
+          name="SAFE_MODE"
+          label="Safe mode"
+          description="When true, new normal runs stay pending and autonomous retries are disabled."
+          defaultValue={runtimeSettingValue(runtime, "safe_mode", "true")}
+          placeholder="true"
+        />
 
         <h3 className="settings-section-title">LM Studio</h3>
         <div className="settings-field settings-field-full">
@@ -1835,6 +1927,32 @@ function RunView(props: {
 }) {
   const { run, events, artifacts, snapshots, diff, workspaceFiles, selectedFile, fileContent, onSelectFile, onFileContent, onNotice, onError, onRefresh } =
     props;
+  const manualRepairArtifact = latestArtifact(artifacts, "log", "manual repair");
+  const localValidationArtifact = latestArtifact(artifacts, "log", "Local validation commands");
+  const validationArtifact = latestArtifact(artifacts, "test_result", "manual validation") || latestArtifact(artifacts, "test_result");
+  const codeArtifact = latestArtifact(artifacts, "code_change");
+  const reviewArtifact = latestArtifact(artifacts, "review");
+  const localValidation = parseArtifactContent<{
+    profile?: string;
+    passed?: boolean;
+    commands?: string[][];
+    failed_command?: string | null;
+    returncode?: number | null;
+    stdout_excerpt?: string;
+    stderr_excerpt?: string;
+    model_tester_passed?: boolean;
+    model_tester_summary?: string;
+    affected_files?: string[];
+  }>(localValidationArtifact);
+  const validation = parseArtifactContent<{ passed?: boolean; summary?: string; commands?: string[]; failures?: string[]; changed_files?: string[] }>(
+    validationArtifact
+  );
+  const repair = parseArtifactContent<{ actions?: string[]; reason?: string }>(manualRepairArtifact);
+  const codeChange = parseArtifactContent<{ changed_files?: string[]; implementation_notes?: string[] }>(codeArtifact);
+  const review = parseArtifactContent<{ approved?: boolean; summary?: string; issues?: string[] }>(reviewArtifact);
+  const blocker = run.active_blocker || null;
+  const changedFiles = Array.from(new Set([...(diff?.changed_files || []), ...(validation?.changed_files || []), ...(codeChange?.changed_files || []), ...(localValidation?.affected_files || []), ...(blocker?.affected_files || [])]));
+  const hasChanges = Boolean(diff?.has_changes || changedFiles.length);
 
   useEffect(() => {
     const prev = document.title;
@@ -1845,10 +1963,37 @@ function RunView(props: {
   }, [run.id, run.task.title]);
 
   const act = async (action: string) => {
+    if (action === "abort") {
+      const stillRunning = !TERMINAL_RUN_STATUSES.has(run.status);
+      const prompt = stillRunning
+        ? "Abort this run?\n\nThe worker will stop at the next checkpoint. The current step may complete before cancellation takes effect."
+        : "Cancel this run?";
+      if (!window.confirm(prompt)) return;
+    } else if (action === "cleanup") {
+      const prompt =
+        "Delete this run's workspace?\n\nThis permanently removes the local checkout and any uncommitted changes on disk. Committed history in the source repo is not affected.";
+      if (!window.confirm(prompt)) return;
+    }
     try {
-      const path = action === "cleanup" ? `/api/runs/${run.id}/cleanup-workspace` : `/api/runs/${run.id}/${action}`;
-      await api(path, { method: "POST", body: action === "cleanup" ? "{}" : JSON.stringify({ note: `Operator ${action}` }) });
-      onNotice(`${action} requested.`);
+      if (action === "cleanup") {
+        const result = await api<CleanupWorkspaceResponse>(
+          `/api/runs/${run.id}/cleanup-workspace`,
+          { method: "POST", body: "{}" }
+        );
+        onNotice(result.removed ? "Workspace removed." : "No workspace to clean up.");
+      } else if (action === "abort") {
+        const result = await api<RunActionApiResponse>(
+          `/api/runs/${run.id}/abort`,
+          { method: "POST", body: JSON.stringify({ note: "Operator abort" }) }
+        );
+        onNotice(result.message || "Run cancelled.");
+      } else {
+        await api(`/api/runs/${run.id}/${action}`, {
+          method: "POST",
+          body: JSON.stringify({ note: `Operator ${action}` }),
+        });
+        onNotice(`${action} requested.`);
+      }
       await onRefresh();
     } catch (err) {
       onError(err instanceof Error ? err.message : `${action} failed.`);
@@ -1869,23 +2014,176 @@ function RunView(props: {
   };
   return (
     <div className="stack">
-      <section className="panel">
-        <div className="run-hero">
+      {blocker ? (
+        <section className="panel blocker-card">
+          <div className="panel-head">
+            <div>
+              <p className="eyebrow">Active blocker</p>
+              <h2>{humanizeSnake(blocker.type)}</h2>
+            </div>
+            <StatusPill value="blocked" />
+          </div>
+          <p>{blocker.message}</p>
+          <div className="blocker-grid">
+            <div><span>Profile</span><strong>{blocker.profile || run.validation_profile}</strong></div>
+            <div><span>Command / guard</span><strong>{blocker.command || blocker.failed_path || "not recorded"}</strong></div>
+            <div><span>Return code</span><strong>{blocker.returncode ?? "-"}</strong></div>
+            <div><span>Scope mismatch</span><strong>{blocker.is_scope_mismatch ? "yes" : "no"}</strong></div>
+          </div>
+          {(blocker.stderr_excerpt || blocker.stdout_excerpt) ? (
+            <pre className="blocker-excerpt">{blocker.stderr_excerpt || blocker.stdout_excerpt}</pre>
+          ) : null}
+          {blocker.affected_files?.length ? (
+            <div className="chip-row">
+              {blocker.affected_files.map((file) => <span key={file}>{file}</span>)}
+            </div>
+          ) : null}
+          <div className="action-row">
+            <button className="ghost" type="button" onClick={() => act("validate")}><Shield size={16} /> Run scoped validation again</button>
+            <button type="button" onClick={() => act("retry-from-blocker")}><RefreshCw size={16} /> Retry from blocker</button>
+            <button className="warn" type="button" onClick={() => act("mark-manual-repair-validated")}><Check size={16} /> Mark manually repaired after validation</button>
+          </div>
+        </section>
+      ) : null}
+      <section className="panel run-detail-hero">
+        <div className="run-detail-top">
           <div>
             <p className="eyebrow">Run detail</p>
             <h2>{run.task.title}</h2>
-            <p className="muted">
+            <p className="muted run-subtitle">{formatTaskSecondaryText(run.task)}</p>
+            <div className="run-id-row">
               <span title={run.id}>Run ID {run.id}</span>
-            </p>
-            <p className="muted">{formatTaskSecondaryText(run.task)}</p>
+              <span>Updated {run.updated_at_human}</span>
+              <span>Retries {run.retry_count}</span>
+              <span>Profile {run.validation_profile}</span>
+            </div>
           </div>
-          <StatusPill value={run.status} />
+          <div className="run-status-stack">
+            <StatusPill value={run.status} />
+            <strong>{runOutcomeLabel(run)}</strong>
+            <span>{humanizeSnake(run.current_stage)}</span>
+          </div>
         </div>
-        <div className="chip-row run-time-row">
-          <span>Task created: {run.task.created_at_human}</span>
-          <span>Run created: {run.created_at_human}</span>
-          <span>Updated: {run.updated_at_human}</span>
-          <span>Retries: {run.retry_count}</span>
+        <div className="run-output-grid">
+          <section className="run-output-card primary">
+            <div className="run-output-card-head">
+              <Check size={18} />
+              <span>Current result</span>
+            </div>
+            <strong>{runOutcomeLabel(run)}</strong>
+            <p>{localValidation?.passed === false ? "Local validation failed." : validation?.summary || review?.summary || run.error_message || "Run output is ready to inspect."}</p>
+          </section>
+          <section className="run-output-card">
+            <div className="run-output-card-head">
+              <GitBranch size={18} />
+              <span>Changed files</span>
+            </div>
+            <strong>{changedFiles.length}</strong>
+            <p>{hasChanges ? "Workspace has proposed code changes." : "No workspace changes detected."}</p>
+          </section>
+          <section className="run-output-card">
+            <div className="run-output-card-head">
+              <Shield size={18} />
+              <span>Validation</span>
+            </div>
+            <strong>{validation?.passed ? "Passed" : validationArtifact ? "Review needed" : "Not recorded"}</strong>
+            <p>{localValidation?.commands?.length ? localValidation.commands.map((cmd) => cmd.join(" ")).join(", ") : validation?.commands?.length ? validation.commands.join(", ") : "No validation commands recorded."}</p>
+          </section>
+        </div>
+        <div className="action-row">
+          {run.status === "awaiting_approval" ? (
+            <>
+              <button type="button" onClick={() => act("approve")}><Check size={16} /> Approve</button>
+              <button className="warn" type="button" onClick={() => act("reject")}><X size={16} /> Reject</button>
+            </>
+          ) : null}
+          <button className="ghost" type="button" onClick={() => act(blocker ? "retry-from-blocker" : "retry")}><RefreshCw size={16} /> {blocker ? "Retry from blocker" : "Retry"}</button>
+          <button
+            className="danger"
+            type="button"
+            onClick={() => act("abort")}
+            disabled={TERMINAL_RUN_STATUSES.has(run.status)}
+            title={TERMINAL_RUN_STATUSES.has(run.status) ? "Run is already in a terminal state" : "Cancel this run at the next checkpoint"}
+          >
+            <Square size={16} /> Abort
+          </button>
+          <button
+            className="ghost"
+            type="button"
+            onClick={() => act("cleanup")}
+            disabled={run.status === "running"}
+            title={run.status === "running" ? "Abort first; cannot clean a running workspace" : "Delete this run's workspace from disk"}
+          >
+            <Archive size={16} /> Cleanup
+          </button>
+        </div>
+      </section>
+
+      <section className="run-output-layout">
+        <section className="panel run-changes-panel">
+          <div className="panel-head">
+            <div>
+              <p className="eyebrow">Output</p>
+              <h2>Workspace Diff</h2>
+            </div>
+            <StatusPill value={hasChanges ? "changes detected" : "clean"} />
+          </div>
+          <div className="changed-file-list">
+            {changedFiles.length === 0 && <div className="empty">No changed files recorded.</div>}
+            {changedFiles.map((file) => (
+              <button className={file === selectedFile ? "selected" : ""} type="button" onClick={() => onSelectFile(file)} key={file}>
+                <Code2 size={15} />
+                <span>{file}</span>
+              </button>
+            ))}
+          </div>
+          <pre className="diff-pre">{diff?.diff_text || "No local diff detected."}</pre>
+        </section>
+
+        <aside className="run-inspector">
+          <section className="panel">
+            <div className="panel-head"><h2>Validation</h2><Shield size={20} /></div>
+            <div className="result-stack">
+              <StatusPill value={localValidation?.passed ? "local passed" : localValidation ? "local failed" : validation?.passed ? "model passed" : "unknown"} />
+              <p>{localValidation?.failed_command ? `${localValidation.failed_command} exited ${localValidation.returncode}` : "Real validation uses local command results first."}</p>
+              {(localValidation?.stderr_excerpt || localValidation?.stdout_excerpt) ? (
+                <pre className="validation-excerpt">{localValidation.stderr_excerpt || localValidation.stdout_excerpt}</pre>
+              ) : null}
+              <div className="tester-summary">
+                <strong>Tester summary</strong>
+                <span>{validation?.summary || localValidation?.model_tester_summary || "No tester summary recorded."}</span>
+              </div>
+              {validation?.failures?.length ? (
+                <ul className="compact-list">{validation.failures.map((failure) => <li key={failure}>{failure}</li>)}</ul>
+              ) : null}
+            </div>
+          </section>
+          <section className="panel">
+            <div className="panel-head"><h2>Repair Notes</h2><FileText size={20} /></div>
+            <div className="result-stack">
+              <p>{repair?.reason || codeChange?.implementation_notes?.[0] || "No repair notes recorded."}</p>
+              {repair?.actions?.length ? (
+                <ul className="compact-list">{repair.actions.map((action) => <li key={action}>{action}</li>)}</ul>
+              ) : null}
+            </div>
+          </section>
+          <section className="panel">
+            <div className="panel-head"><h2>Review</h2><Activity size={20} /></div>
+            <div className="result-stack">
+              <StatusPill value={review?.approved ? "approved" : reviewArtifact ? "reviewed" : "not reviewed"} />
+              <p>{review?.summary || "No review summary recorded."}</p>
+            </div>
+          </section>
+        </aside>
+      </section>
+
+      <section className="panel run-progress-panel">
+        <div className="panel-head">
+          <div>
+            <p className="eyebrow">Progress</p>
+            <h2>Pipeline</h2>
+          </div>
+          <span className="muted">Task created {run.task.created_at_human}</span>
         </div>
         {run.error_message ? (
           <div className="error-panel">
@@ -1904,17 +2202,6 @@ function RunView(props: {
             );
           })}
         </div>
-        <div className="action-row">
-          {run.status === "awaiting_approval" ? (
-            <>
-              <button type="button" onClick={() => act("approve")}><Check size={16} /> Approve</button>
-              <button className="warn" type="button" onClick={() => act("reject")}><X size={16} /> Reject</button>
-            </>
-          ) : null}
-          <button className="ghost" type="button" onClick={() => act("retry")}><RefreshCw size={16} /> Retry</button>
-          <button className="danger" type="button" onClick={() => act("abort")}><Square size={16} /> Abort</button>
-          <button className="ghost" type="button" onClick={() => act("cleanup")}><Archive size={16} /> Cleanup</button>
-        </div>
       </section>
 
       <section className="detail-grid">
@@ -1922,32 +2209,25 @@ function RunView(props: {
         <PanelList title="State Snapshots" icon={<Activity />} items={snapshots.slice(-8).reverse().map((item) => [`${item.stage} / ${item.status}`, `retry_count=${item.retry_count}`])} />
       </section>
 
-      <section className="detail-grid">
-        <section className="panel">
-          <div className="panel-head"><h2>Artifacts</h2><FileText size={20} /></div>
-          <div className="list">
-            {artifacts.length === 0 && <div className="empty">No artifacts recorded yet.</div>}
-            {artifacts.map((artifact) => (
-              <details className="artifact" key={artifact.id}>
-                <summary>
+      <section className="panel">
+        <div className="panel-head"><h2>Artifacts</h2><FileText size={20} /></div>
+        <div className="artifact-grid">
+          {artifacts.length === 0 && <div className="empty">No artifacts recorded yet.</div>}
+          {artifacts.map((artifact) => (
+            <details className="artifact" key={artifact.id}>
+              <summary>
+                <span>
                   {artifact.title}
                   {shouldShowArtifactTypeLabel(artifact.title, artifact.artifact_type) ? (
                     <span className="muted"> {humanizeSnake(artifact.artifact_type)}</span>
                   ) : null}
-                </summary>
-                <pre>{artifact.content}</pre>
-              </details>
-            ))}
-          </div>
-        </section>
-        <section className="panel">
-          <div className="panel-head">
-            <h2>Workspace Diff</h2>
-            <StatusPill value={diff?.has_changes ? "changes detected" : "clean"} />
-          </div>
-          <div className="chip-row">{diff?.changed_files.map((file) => <span key={file}>{file}</span>)}</div>
-          <pre>{diff?.diff_text || "No local diff detected."}</pre>
-        </section>
+                </span>
+                <span className="muted">{formatEventTime(artifact.created_at)}</span>
+              </summary>
+              <pre>{artifact.content}</pre>
+            </details>
+          ))}
+        </div>
       </section>
 
       <section className="panel">

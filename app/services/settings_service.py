@@ -18,6 +18,7 @@ EDITABLE_ENV_KEYS = {
     "LMSTUDIO_MODEL_SUPERVISOR",
     "LMSTUDIO_API_KEY",
     "PROVIDER_TIMEOUT_SECONDS",
+    "SAFE_MODE",
     "SOURCE_REPO_PATH",
     "ALLOWED_GIT_HOSTS",
     "GITHUB_REPO_FULL_NAME",
@@ -92,10 +93,10 @@ def _validate_local_settings(values: dict[str, str]) -> None:
         if raw_value is None or raw_value == "":
             continue
         try:
-            parsed = int(raw_value)
+            parsed_int = int(raw_value)
         except ValueError as exc:
             raise ValueError(f"{key} must be an integer.") from exc
-        if parsed <= 0:
+        if parsed_int <= 0:
             raise ValueError(f"{key} must be greater than zero.")
 
     for key in POSITIVE_FLOAT_ENV_KEYS:
@@ -103,8 +104,8 @@ def _validate_local_settings(values: dict[str, str]) -> None:
         if raw_value is None or raw_value == "":
             continue
         try:
-            parsed = float(raw_value)
+            parsed_float = float(raw_value)
         except ValueError as exc:
             raise ValueError(f"{key} must be a number.") from exc
-        if parsed <= 0:
+        if parsed_float <= 0:
             raise ValueError(f"{key} must be greater than zero.")

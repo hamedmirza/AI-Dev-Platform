@@ -8,6 +8,7 @@ from app.core.settings import get_settings
 from app.services.github_service import get_github_status, github_repo_metadata
 from app.services.lmstudio_models_service import fetch_lmstudio_models
 from app.services.repository_service import get_repository_config_snapshot
+from app.tools.command_runner import available_validation_profiles
 
 router = APIRouter(tags=["config"])
 
@@ -36,6 +37,8 @@ def config_summary() -> dict[str, object]:
         "model_provider": settings.model_provider,
         "backup_root": str(settings.backup_root_path),
         "worker_count": settings.worker_count,
+        "safe_mode": settings.safe_mode,
+        "validation_profiles": available_validation_profiles(),
         "provider_snapshot_policy": "future_runs_only",
         "git_transport": "host-managed",
         "github_api_auth": "app-managed-token",
@@ -55,6 +58,8 @@ def config_summary() -> dict[str, object]:
             "provider_timeout_seconds": settings.provider_timeout_seconds,
             "planner_stage_timeout_seconds": settings.planner_stage_timeout_seconds,
             "planner_stage_max_retries": settings.planner_stage_max_retries,
+            "safe_mode": settings.safe_mode,
+            "validation_profiles": available_validation_profiles(),
             "allowed_git_hosts": settings.allowed_git_hosts,
             "allowed_source_repo_roots": settings.allowed_source_repo_roots,
             "git_clone_timeout_seconds": settings.git_clone_timeout_seconds,

@@ -47,7 +47,8 @@ def test_coder_and_tester_prompts_include_safety_constraints() -> None:
     assert "APIRouter" in coder_prompt
     assert "Do not replace `app/ui/routes.py` with a standalone `FastAPI()` app." in coder_prompt
     assert "login, dashboard, repository, provider, settings, backups" in coder_prompt
-    assert "ruff check ." in tester_prompt
+    assert "ruff check app tests" in tester_prompt
+    assert "npm --prefix frontend run build" in tester_prompt
     assert "mypy app" in tester_prompt
     assert "pytest -q" in tester_prompt
     assert "Do not emit shell builtins" in tester_prompt
@@ -96,13 +97,17 @@ def test_orchestration_requests_reinforce_ui_and_validation_constraints(
             ),
             retry_feedback=[],
         )
-        test_request = service._build_test_request("Improve the UI.", retry_feedback=[])
+        test_request = service._build_test_request(
+            "Improve the UI.",
+            retry_feedback=[],
+            run_id=run_id,
+        )
 
         assert "Preserve existing FastAPI APIRouter setup" in coder_request
         assert "Do not create a standalone FastAPI() app" in coder_request
         assert "workspace editor" in coder_request
-        assert "Validation command whitelist" in test_request
-        assert "ruff check ." in test_request
+        assert "Selected validation profile:" in test_request
+        assert "profile-scoped commands" in test_request
         assert "python -c" in test_request
     finally:
         clear_settings_cache()

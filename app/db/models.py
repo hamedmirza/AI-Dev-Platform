@@ -30,6 +30,8 @@ class TaskModel(Base):
     source_repo_spec: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     use_scout: Mapped[bool] = mapped_column(Boolean, default=False)
     stage_models_json: Mapped[str] = mapped_column(Text, default="{}")
+    validation_profile: Mapped[str] = mapped_column(String(64), default="auto")
+    validation_commands_json: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     runs: Mapped[list["RunModel"]] = relationship(back_populates="task")
@@ -55,7 +57,8 @@ class ProjectModel(Base):
     status: Mapped[str] = mapped_column(String(64), index=True, default="intake")
     app_type: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     target_stack_json: Mapped[str] = mapped_column(Text, default="{}")
-    validation_profile: Mapped[str] = mapped_column(String(128), default="python")
+    validation_profile: Mapped[str] = mapped_column(String(128), default="auto")
+    validation_commands_json: Mapped[str] = mapped_column(Text, default="[]")
     readiness_score: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
@@ -169,6 +172,8 @@ class RunModel(Base):
     provider_name: Mapped[str] = mapped_column(String(64))
     request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    validation_profile: Mapped[str] = mapped_column(String(64), default="auto")
+    active_blocker_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
@@ -234,7 +239,7 @@ class RunStateSnapshotModel(Base):
 
 
 class RepoLessonModel(Base):
-    """Cross-run factual snippets for planner context (per repo_key scope)."""
+    """Cross-run factual snippets injected into agent prompts (per repo_key scope)."""
 
     __tablename__ = "repo_lessons"
 

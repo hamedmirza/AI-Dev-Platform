@@ -14,6 +14,8 @@ and ``file_change_plan`` on the architecture artifact — verified where noted.
 from __future__ import annotations
 
 import json
+import shutil
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -21,6 +23,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.settings import clear_settings_cache
 from app.db.models import RunModel, TaskModel
 from app.db.session import get_session_factory
 from tests.unit.test_api import (
@@ -567,6 +570,93 @@ def s40_ui_shell_login(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         assert "root" in dash.text and "/ui/assets/" in dash.text
 
 
+def s41_safe_mode_api_task_stays_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rationale: with SAFE_MODE=true the API must record the task but NOT auto-enqueue it."""
+    with build_client(tmp_path, monkeypatch) as c:
+        monkeypatch.setenv("SAFE_MODE", "true")
+        clear_settings_cache()
+        run_id = _create_run(c, {"title": "Safe mode API task", "request_text": REQ})
+        # Give workers ample time to do nothing.
+        for _ in range(30):
+            body = c.get(f"/api/runs/{run_id}", headers=HDR).json()
+            if body["status"] != "pending":
+                break
+            time.sleep(0.05)
+        body = c.get(f"/api/runs/{run_id}", headers=HDR).json()
+        assert body["status"] == "pending", (
+            f"fact: run must stay pending under SAFE_MODE, got {body['status']!r}"
+        )
+
+
+def s42_safe_mode_ui_task_stays_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rationale: legacy UI form path must match API: SAFE_MODE leaves new runs idle."""
+    with build_client(tmp_path, monkeypatch) as c:
+        c.post("/ui/login", data={"token": "test-token"}, follow_redirects=False)
+        monkeypatch.setenv("SAFE_MODE", "true")
+        clear_settings_cache()
+        r = c.post(
+            "/ui/tasks",
+            data={
+                "title": "Safe mode UI task",
+                "request_text": REQ,
+                "task_type": "feature",
+            },
+            follow_redirects=False,
+        )
+        assert r.status_code in (200, 303), r.text
+        runs = c.get("/api/runs?limit=5", headers=HDR).json()
+        assert runs, "fact: UI task creation must persist a run"
+        latest = runs[0]
+        assert latest["status"] == "pending", (
+            f"fact: UI-created task must stay pending under SAFE_MODE, got {latest['status']!r}"
+        )
+
+
+def s43_approve_with_missing_workspace_returns_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rationale: approve must refuse cleanly when the workspace directory was wiped."""
+    with build_client(tmp_path, monkeypatch) as c:
+        run_id = _create_run(c, {"title": "Approve missing workspace", "request_text": REQ})
+        assert wait_for_run_status(c, run_id, HDR, {"awaiting_approval", "failed", "blocked"}) == (
+            "awaiting_approval"
+        )
+        workspace_dir = tmp_path / "workspace" / f"run-{run_id}"
+        assert workspace_dir.exists()
+        shutil.rmtree(workspace_dir)
+        resp = c.post(f"/api/runs/{run_id}/approve", headers=HDR, json={"note": "no ws"})
+        assert resp.status_code == 409, resp.text
+        detail = resp.json().get("detail", "")
+        assert "workspace is missing" in detail.lower(), f"fact: actionable detail, got {detail!r}"
+        # Run must remain awaiting_approval after the refused approval.
+        post_body = c.get(f"/api/runs/{run_id}", headers=HDR).json()
+        assert post_body["status"] == "awaiting_approval"
+
+
+def s44_reject_actionable_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rationale: reject must leave the run idle with a message the operator can act on."""
+    with build_client(tmp_path, monkeypatch) as c:
+        run_id = _create_run(c, {"title": "Reject actionable", "request_text": REQ})
+        assert wait_for_run_status(c, run_id, HDR, {"awaiting_approval", "failed", "blocked"}) == (
+            "awaiting_approval"
+        )
+        rj = c.post(f"/api/runs/{run_id}/reject", headers=HDR, json={"note": "nope"})
+        assert rj.status_code == 200
+        body = c.get(f"/api/runs/{run_id}", headers=HDR).json()
+        assert body["status"] == "review_required"
+        assert body["current_stage"] == "coder"
+        err = body.get("error_message") or ""
+        assert "retry" in err.lower(), (
+            f"fact: error_message must guide operator to Retry, got {err!r}"
+        )
+
+
 SCENARIOS: list[tuple[str, str, Callable[[Path, pytest.MonkeyPatch], None]]] = [
     ("S01_health_live", "Expose liveness JSON for probes.", s01_health_live),
     ("S02_health", "Aggregate API health with request id.", s02_health),
@@ -632,9 +722,29 @@ SCENARIOS: list[tuple[str, str, Callable[[Path, pytest.MonkeyPatch], None]]] = [
     ("S38_retry", "Retry after reject returns pending.", s38_retry_resets_pending),
     ("S39_cleanup", "Cleanup removes workspace after abort.", s39_cleanup_workspace),
     ("S40_ui_shell", "Login page loads; authed dashboard embeds React assets.", s40_ui_shell_login),
+    (
+        "S41_safe_mode_api",
+        "SAFE_MODE=true: API task creation does not auto-enqueue.",
+        s41_safe_mode_api_task_stays_pending,
+    ),
+    (
+        "S42_safe_mode_ui",
+        "SAFE_MODE=true: legacy UI task creation matches API parity.",
+        s42_safe_mode_ui_task_stays_pending,
+    ),
+    (
+        "S43_approve_missing_ws",
+        "Approve refuses with 409 when workspace directory is gone.",
+        s43_approve_with_missing_workspace_returns_409,
+    ),
+    (
+        "S44_reject_actionable",
+        "Reject leaves run idle with an actionable retry message.",
+        s44_reject_actionable_message,
+    ),
 ]
 
-assert len(SCENARIOS) == 40, "scenario matrix must contain exactly 40 rows"
+assert len(SCENARIOS) == 44, "scenario matrix must contain 44 rows (40 original + 4 phase-2/3)"
 
 
 @pytest.mark.parametrize(

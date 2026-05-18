@@ -16,8 +16,24 @@ class TaskSummaryResponse(BaseModel):
     provider_override: Optional[str]
     model_override: Optional[str]
     request_text: str
+    validation_profile: str = "auto"
     created_at: datetime
     created_at_human: str
+
+
+class RunBlockerResponse(BaseModel):
+    type: str
+    message: str
+    command: Optional[str] = None
+    failed_path: Optional[str] = None
+    returncode: Optional[int] = None
+    stdout_excerpt: Optional[str] = None
+    stderr_excerpt: Optional[str] = None
+    affected_files: list[str] = []
+    retry_eligible: bool = True
+    suggested_retry_instruction: Optional[str] = None
+    is_scope_mismatch: bool = False
+    profile: Optional[str] = None
 
 
 class RunStateSnapshotResponse(BaseModel):
@@ -37,6 +53,8 @@ class RunResponse(BaseModel):
     provider_name: str
     request_id: Optional[str]
     retry_count: int
+    validation_profile: str = "auto"
+    active_blocker: Optional[RunBlockerResponse] = None
     error_message: Optional[str]
     created_at: datetime
     updated_at: datetime

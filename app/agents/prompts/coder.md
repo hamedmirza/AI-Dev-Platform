@@ -50,11 +50,10 @@ For the AI Dev Platform operator console (Python repo containing `app/ui/routes.
   form fields, redirects, imports, and auth/session behavior unless the task
   explicitly asks to change them.
 - Do not replace `app/ui/routes.py` with a standalone `FastAPI()` app.
-- Do not remove existing UI flows: login, dashboard, repository, provider, settings,
-  backups, run detail, run actions, workspace diff, workspace file editor, backup
-  restore rehearsal.
+- Do not remove existing UI flows: login, dashboard, repository, provider, settings, backups,
+  run detail, run actions, workspace diff, workspace file editor, backup restore rehearsal.
 - Prefer scoped edits to rendering helpers, CSS, classes, HTML fragments, and
   existing route body markup.
 - If changing `app/ui/routes.py`, keep existing endpoint behavior compatible and
   explain each route-level change in `implementation_notes`.
-- Generate Python that passes `ruff check .`, `mypy app`, and `pytest -q`.
+- Generate changes that pass the selected validation profile in the tester request.

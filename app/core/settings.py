@@ -6,6 +6,11 @@ from typing import Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.exceptions import ConfigurationError
+
+INSECURE_API_TOKEN_DEFAULT = "dev-token"
+INSECURE_ENCRYPTION_KEY_DEFAULT = "change-me"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -47,6 +52,7 @@ class Settings(BaseSettings):
         alias="PLANNER_STAGE_TIMEOUT_SECONDS",
     )
     planner_stage_max_retries: int = Field(default=2, alias="PLANNER_STAGE_MAX_RETRIES")
+    safe_mode: bool = Field(default=True, alias="SAFE_MODE")
 
     workspace_root: str = Field(default="./workspace", alias="WORKSPACE_ROOT")
     source_repo_path: Optional[str] = Field(default=None, alias="SOURCE_REPO_PATH")
@@ -83,6 +89,19 @@ class Settings(BaseSettings):
     )
     playbook_char_limit: int = Field(default=8000, alias="PLAYBOOK_CHAR_LIMIT")
     repo_lesson_max_lines: int = Field(default=40, alias="REPO_LESSON_MAX_LINES")
+    auto_persist_failure_lessons: bool = Field(
+        default=True,
+        alias="AUTO_PERSIST_FAILURE_LESSONS",
+    )
+    retry_feedback_max_items: int = Field(default=24, alias="RETRY_FEEDBACK_MAX_ITEMS")
+    repo_lesson_auto_max_per_event: int = Field(
+        default=6,
+        alias="REPO_LESSON_AUTO_MAX_PER_EVENT",
+    )
+    architect_refresh_after_retries: int = Field(
+        default=2,
+        alias="ARCHITECT_REFRESH_AFTER_RETRIES",
+    )
 
     @field_validator("github_repo_full_name", mode="before")
     @classmethod
@@ -124,6 +143,29 @@ class Settings(BaseSettings):
         if (cwd / ".git").exists():
             return cwd
         return None
+
+    def validate_production_safety(self) -> None:
+        """Raise ConfigurationError when production env still uses dev/demo secrets.
+
+        Run at app startup so a misconfigured production deployment fails fast
+        instead of silently exposing well-known credentials.
+        """
+        if self.app_env.lower() != "production":
+            return
+        offenders: list[str] = []
+        if self.app_api_token == INSECURE_API_TOKEN_DEFAULT:
+            offenders.append(
+                "APP_API_TOKEN is using the development default; set a strong unique value."
+            )
+        if self.encryption_key == INSECURE_ENCRYPTION_KEY_DEFAULT:
+            offenders.append(
+                "APP_ENCRYPTION_KEY is using the development default; set a strong unique value."
+            )
+        if offenders:
+            raise ConfigurationError(
+                "Refusing to start in production with insecure defaults: "
+                + " ".join(offenders)
+            )
 
 
 @lru_cache(maxsize=1)

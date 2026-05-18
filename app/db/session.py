@@ -97,16 +97,27 @@ def _apply_lightweight_migrations(engine) -> None:
         "source_repo_spec": "TEXT",
         "use_scout": "INTEGER DEFAULT 0 NOT NULL",
         "stage_models_json": "TEXT DEFAULT '{}' NOT NULL",
+        "validation_profile": "VARCHAR(64) DEFAULT 'auto' NOT NULL",
+        "validation_commands_json": "TEXT DEFAULT '[]' NOT NULL",
+    }
+    project_columns = {column["name"] for column in inspector.get_columns("projects")}
+    project_additions = {
+        "validation_commands_json": "TEXT DEFAULT '[]' NOT NULL",
     }
     run_additions = {
         "request_id": "VARCHAR(64)",
         "retry_count": "INTEGER DEFAULT 0 NOT NULL",
+        "validation_profile": "VARCHAR(64) DEFAULT 'auto' NOT NULL",
+        "active_blocker_json": "TEXT",
     }
 
     with engine.begin() as connection:
         for column_name, ddl in task_additions.items():
             if column_name not in task_columns:
                 connection.execute(text(f"ALTER TABLE tasks ADD COLUMN {column_name} {ddl}"))
+        for column_name, ddl in project_additions.items():
+            if column_name not in project_columns:
+                connection.execute(text(f"ALTER TABLE projects ADD COLUMN {column_name} {ddl}"))
         for column_name, ddl in run_additions.items():
             if column_name not in run_columns:
                 connection.execute(text(f"ALTER TABLE runs ADD COLUMN {column_name} {ddl}"))

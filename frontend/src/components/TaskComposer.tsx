@@ -106,6 +106,7 @@ export function TaskComposer({
           model: String(form.get("model") || "") || null,
           source_repo: String(form.get("source_repo") || "") || null,
           use_scout: form.get("use_scout") === "on",
+          validation_profile: String(form.get("validation_profile") || "auto"),
           stage_models
         })
       });
@@ -203,6 +204,15 @@ export function TaskComposer({
             <div>
               <label className="field-label" htmlFor="target_files">Target files</label>
               <input id="target_files" name="target_files" placeholder="Comma-separated paths (optional)" />
+            </div>
+            <div>
+              <label className="field-label" htmlFor="validation_profile">Validation profile</label>
+              <select id="validation_profile" name="validation_profile" defaultValue="auto">
+                <option value="auto">Auto detect</option>
+                <option value="python">Python</option>
+                <option value="react-vite">React/Vite</option>
+                <option value="full-stack">Full-stack</option>
+              </select>
             </div>
             <div>
               <label className="field-label" htmlFor="constraints">Constraints</label>

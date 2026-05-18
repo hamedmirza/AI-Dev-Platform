@@ -91,6 +91,7 @@ def create_project(session: Session, payload: ProjectCreate) -> ProjectDetail:
         status="intake",
         app_type=payload.app_type,
         validation_profile=payload.validation_profile,
+        validation_commands_json=json.dumps(payload.validation_commands),
     )
     session.add(project)
     session.flush()
@@ -291,6 +292,8 @@ def start_project_build(session: Session, project_id: str) -> tuple[ProjectDetai
                 ),
             ],
             source_repo=project.source_repo_spec,
+            validation_profile=project.validation_profile or "auto",
+            validation_commands=_json_list(project.validation_commands_json),
         )
         created = create_task_and_run(
             session,

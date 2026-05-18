@@ -22,6 +22,19 @@ class TaskCreate(BaseModel):
     source_repo: Optional[str] = None
     use_scout: bool = False
     stage_models: Optional[dict[str, str]] = None
+    validation_profile: str = "auto"
+    validation_commands: list[str] = Field(default_factory=list)
+
+    @field_validator("validation_profile")
+    @classmethod
+    def validate_validation_profile(cls, value: str) -> str:
+        profile = (value or "auto").strip().lower()
+        allowed = {"auto", "python", "react-vite", "full-stack", "custom"}
+        if profile not in allowed:
+            raise ValueError(
+                "validation_profile must be one of auto, python, react-vite, full-stack, custom."
+            )
+        return profile
 
     @field_validator("source_repo")
     @classmethod
@@ -58,6 +71,11 @@ class TaskCreate(BaseModel):
                 out[k] = raw.strip()
         return out or None
 
+    @field_validator("validation_commands")
+    @classmethod
+    def validate_validation_commands(cls, value: list[str]) -> list[str]:
+        return [item.strip() for item in value if item.strip()]
+
     @model_validator(mode="after")
     def validate_request_fields(self) -> "TaskCreate":
         if not self.request_text and not self.description:
@@ -86,6 +104,11 @@ class TaskCreate(BaseModel):
         if self.target_files:
             lines.append("Target files:")
             lines.extend(f"- {item}" for item in self.target_files)
+        if self.validation_profile:
+            lines.append(f"Validation profile: {self.validation_profile}")
+        if self.validation_commands:
+            lines.append("Validation commands:")
+            lines.extend(f"- {item}" for item in self.validation_commands)
         if self.provider:
             lines.append(f"Provider override: {self.provider}")
         if self.model:

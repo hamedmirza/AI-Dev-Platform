@@ -687,9 +687,15 @@ def create_task_ui(
         if session.is_active:
             session.close()
 
-    get_orchestration_service().enqueue_run(task.run_id)
+    if not get_settings().safe_mode:
+        get_orchestration_service().enqueue_run(task.run_id)
+        success_message = "Task+created."
+    else:
+        success_message = (
+            "Task+created.+Safe+mode+is+ON,+so+the+run+stays+PENDING+until+you+retry+it."
+        )
     return RedirectResponse(
-        f"/ui?success=Task+created.&created_run_id={quote_plus(task.run_id)}",
+        f"/ui?success={success_message}&created_run_id={quote_plus(task.run_id)}",
         status_code=303,
     )
 
@@ -787,10 +793,15 @@ def cleanup_ui(request: Request, run_id: str):
     redirect = _require_authorized(request)
     if redirect:
         return redirect
+    session = get_session_factory()()
     try:
-        cleanup_workspace(run_id)
+        cleanup_workspace(session, run_id)
+    except WorkflowError as exc:
+        return _run_action_redirect(run_id, str(exc))
     except Exception as exc:
         return _run_action_redirect(run_id, str(exc))
+    finally:
+        session.close()
     return _run_action_redirect(run_id)
 
 

@@ -26,8 +26,12 @@ class FakeProvider(BaseProvider):
 
     def invoke_json(self, system_prompt: str, user_prompt: str) -> str:
         payload: dict[str, Any]
-        prompt = f"{system_prompt}\n{user_prompt}".lower()
-        if "summary, assumptions, risks, steps" in prompt:
+        # Route by the *user_prompt_template* keyword — each stage template has a unique
+        # sentinel phrase.  Check system_prompt only as a tiebreaker so that content
+        # injected into the user prompt (diffs, lessons, acceptance criteria) cannot
+        # accidentally hijack stage routing.
+        stage_hint = system_prompt.lower()
+        if "summary, assumptions, risks, steps" in user_prompt.lower():
             payload = {
                 "summary": "Implement the requested backend feature.",
                 "assumptions": ["Repository is configured."],
@@ -35,7 +39,7 @@ class FakeProvider(BaseProvider):
                 "steps": ["Inspect current code", "Propose changes", "Validate outputs"],
                 "acceptance_criteria": ["Routes respond", "Artifacts are stored"],
             }
-        elif "changed_files" in prompt:
+        elif "line_changes, and file_changes for this task" in user_prompt.lower():
             payload = {
                 "changed_files": ["README.md"],
                 "implementation_notes": ["Apply a small workspace change."],
@@ -48,7 +52,7 @@ class FakeProvider(BaseProvider):
                     }
                 ],
             }
-        elif "visual_system" in prompt:
+        elif "design_summary, visual_system" in user_prompt.lower():
             payload = {
                 "design_summary": "Use a crisp, modern operations-console interface.",
                 "visual_system": ["High contrast surfaces", "Clear status colors"],
@@ -57,14 +61,17 @@ class FakeProvider(BaseProvider):
                 "accessibility_notes": ["Maintain readable contrast and focus states"],
                 "implementation_notes": ["Use responsive grids and compact panels"],
             }
-        elif "touched_modules" in prompt:
+        elif "touched_modules, file_change_plan" in user_prompt.lower():
             payload = {
                 "touched_modules": ["app/api", "app/services"],
                 "file_change_plan": ["Add API endpoints", "Store artifacts"],
                 "dependency_notes": [],
                 "migration_notes": [],
             }
-        elif "approved" in prompt:
+        elif (
+            "reviewer agent" in stage_hint
+            or "return json with approved, summary" in user_prompt.lower()
+        ):
             if self.review_failures_remaining > 0:
                 self.review_failures_remaining -= 1
                 payload = {
@@ -355,6 +362,7 @@ def build_client(
     monkeypatch.setenv("BACKUP_ROOT", str(backup_root))
     monkeypatch.setenv("SOURCE_REPO_PATH", str(source_repo))
     monkeypatch.setenv("APP_SETTINGS_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("SAFE_MODE", "false")
 
     source_repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-b", "main"], cwd=source_repo, check=True, capture_output=True)
@@ -1509,7 +1517,12 @@ def test_running_run_can_be_cancelled_at_checkpoint(tmp_path: Path, monkeypatch)
 
         abort = client.post(f"/api/runs/{run_id}/abort", headers=headers, json={"note": None})
         assert abort.status_code == 200
-        assert abort.json()["status"] == "cancelled"
+        abort_body = abort.json()
+        assert abort_body["status"] == "cancelled"
+        assert "next checkpoint" in abort_body["message"], (
+            "Aborting a RUNNING run must surface the soft-cancel semantics in the "
+            f"message so the operator knows it isn't instant; got {abort_body['message']!r}"
+        )
 
         cancelled = wait_for_run_status(client, run_id, headers, {"cancelled"})
         assert cancelled == "cancelled"
@@ -1527,6 +1540,70 @@ def test_running_run_can_be_cancelled_at_checkpoint(tmp_path: Path, monkeypatch)
             refreshed_types = [item["event_type"] for item in refreshed.json()]
             saw_checkpoint = "run_cancelled_checkpoint" in refreshed_types
         assert saw_checkpoint
+
+
+def test_cleanup_workspace_rejected_while_run_is_running(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """POST /cleanup-workspace must return 409 when the run is still running.
+
+    The earlier implementation called shutil.rmtree unconditionally, which would
+    blow up a workspace from under an active worker. We assert the new safety
+    guard against a RUNNING status row directly to avoid racing the background
+    worker during teardown.
+    """
+    client = build_client(tmp_path, monkeypatch)
+    headers = {"x-api-token": "test-token"}
+
+    with client:
+        # Insert a synthetic RUNNING run with no live worker so the guard is the
+        # only thing in play here.
+        session = get_session_factory()()
+        try:
+            task = TaskModel(
+                title="Cleanup guard fixture",
+                request_text="Synthetic RUNNING run for cleanup guard test.",
+            )
+            session.add(task)
+            session.flush()
+            run = RunModel(
+                task_id=task.id,
+                status=RunStatus.RUNNING,
+                current_stage=RunStage.CODER,
+                provider_name="fake",
+            )
+            session.add(run)
+            session.commit()
+            run_id = run.id
+        finally:
+            session.close()
+
+        blocked = client.post(
+            f"/api/runs/{run_id}/cleanup-workspace", headers=headers
+        )
+        assert blocked.status_code == 409, (
+            f"Cleanup must be refused while running; got {blocked.status_code} "
+            f"body={blocked.text!r}"
+        )
+        detail = blocked.json()["detail"]
+        assert "still running" in detail
+        assert "Abort the run first" in detail
+
+        # Once the row leaves RUNNING the guard releases.
+        session = get_session_factory()()
+        try:
+            run = session.get(RunModel, run_id)
+            assert run is not None
+            run.status = RunStatus.CANCELLED
+            session.commit()
+        finally:
+            session.close()
+
+        cleanup = client.post(
+            f"/api/runs/{run_id}/cleanup-workspace", headers=headers
+        )
+        assert cleanup.status_code == 200
+        assert "removed" in cleanup.json()
 
 
 def test_worker_count_two_runs_concurrent_isolation(tmp_path: Path, monkeypatch) -> None:

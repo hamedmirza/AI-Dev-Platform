@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional, cast
 
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.enums import ArtifactType, ProviderStatus, RunStage, RunStatus, StringEnum
 from app.core.exceptions import ConfigurationError, ProviderError, WorkflowError
@@ -42,7 +42,13 @@ from app.schemas.plan import PlanResponse
 from app.schemas.review import ReviewResponse
 from app.schemas.test_result import TestResultResponse
 from app.schemas.ui_design import UIDesignResponse
-from app.services.lesson_service import load_lessons_prompt_prefix
+from app.services.lesson_service import (
+    format_accumulated_retry_feedback,
+    load_lessons_prompt_prefix,
+    merge_retry_feedback,
+    persist_failure_lessons,
+    stage_receives_repo_lessons,
+)
 from app.services.playbook_service import load_active_playbook_overlay
 from app.services.repository_service import (
     create_run_workspace,
@@ -54,7 +60,11 @@ from app.services.repository_service import (
 )
 from app.services.source_repo_policy import repo_key_for_source_spec, validate_source_repo_spec
 from app.tools.base import CommandResult
-from app.tools.command_runner import run_validation_command
+from app.tools.command_runner import (
+    resolve_validation_profile,
+    run_validation_command,
+    validation_commands_for_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -151,9 +161,9 @@ STAGES: list[StageDefinition] = [
         system_prompt_path="app/agents/prompts/tester.md",
         user_prompt_template=(
             "Return JSON with passed, summary, commands, and failures describing the "
-            "validation strategy for this task. commands must contain only whitelist-safe "
-            "commands: ruff check ., mypy app, pytest -q, pytest tests -q, or pytest "
-            "<test-path> -q. Do not emit shell builtins, pipes, redirects, grep, find, "
+            "validation strategy for this task. commands must contain only the selected "
+            "validation profile commands provided in the request. Do not emit shell "
+            "builtins, pipes, redirects, grep, find, "
             "test, python -c, bash, sh, awk, sed, curl, or compound commands:\n\n{request_text}"
         ),
     ),
@@ -193,8 +203,14 @@ class OrchestrationService:
             )
             self._worker_threads.append(thread)
             thread.start()
-        for run_id in recovered_pending_runs:
-            self.enqueue_run(run_id)
+        if settings.safe_mode and recovered_pending_runs:
+            logger.info(
+                "Safe mode active; leaving %s pending runs queued for manual action.",
+                len(recovered_pending_runs),
+            )
+        else:
+            for run_id in recovered_pending_runs:
+                self.enqueue_run(run_id)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -205,6 +221,79 @@ class OrchestrationService:
 
     def enqueue_run(self, run_id: str) -> None:
         self._queue.put(run_id)
+
+    def validate_run_workspace(
+        self,
+        run_id: str,
+        *,
+        mark_repaired: bool = False,
+    ) -> dict[str, object]:
+        session = get_session_factory()()
+        try:
+            run = session.get(RunModel, run_id)
+            if run is None:
+                raise WorkflowError("Run not found.")
+            task = session.get(TaskModel, run.task_id)
+            if task is None:
+                raise WorkflowError("Task record is missing.")
+            workspace_path = get_run_workspace_path(run.id)
+            profile = getattr(run, "validation_profile", None) or self._resolve_validation_profile(
+                task,
+                workspace_path,
+            )
+            run.validation_profile = profile
+            test_model = TestResultResponse(
+                passed=True,
+                summary="Manual scoped validation requested by operator.",
+                commands=[],
+                failures=[],
+            )
+            passed, failures = self._run_local_validation(session, run, test_model)
+            payload = self._latest_validation_payload(session, run.id) or {
+                "profile": profile,
+                "passed": passed,
+                "failures": failures,
+            }
+            if passed and mark_repaired:
+                run.status = RunStatus.AWAITING_APPROVAL
+                run.current_stage = RunStage.APPROVAL
+                run.error_message = None
+                run.active_blocker_json = None
+                self._add_event(
+                    session,
+                    run.id,
+                    "manual_repair_validated",
+                    "Operator-marked repair passed scoped local validation.",
+                    json.dumps(payload, indent=2),
+                )
+                self._record_state_snapshot(
+                    session,
+                    run,
+                    self._build_state_for_stage(run, RunStage.APPROVAL),
+                    current_step="manual_repair_validated",
+                    payload=payload,
+                )
+                session.commit()
+            elif not passed:
+                blocker = self._blocker_from_payload(
+                    run,
+                    "validation_failed",
+                    "Manual scoped validation failed.",
+                    json.dumps(payload, indent=2),
+                    retry_eligible=True,
+                )
+                run.active_blocker_json = json.dumps(blocker, indent=2)
+                self._add_event(
+                    session,
+                    run.id,
+                    "manual_validation_failed",
+                    "Manual scoped validation failed.",
+                    json.dumps(blocker, indent=2),
+                )
+                session.commit()
+            return payload
+        finally:
+            session.close()
 
     def _recover_interrupted_runs(self) -> list[str]:
         session = get_session_factory()()
@@ -277,13 +366,43 @@ class OrchestrationService:
             finally:
                 self._queue.task_done()
 
+    def _claim_pending_run(self, session, run_id: str) -> Optional[RunModel]:
+        """Atomically transition a run from PENDING to RUNNING.
+
+        Returns the refreshed RunModel only when this worker won the claim. Returns None
+        when the run does not exist, has already been claimed by another worker, or is
+        in a state that should not be re-processed (cancelled, blocked, completed,
+        awaiting_approval, failed, etc.).
+        """
+        result = session.execute(
+            update(RunModel)
+            .where(RunModel.id == run_id, RunModel.status == RunStatus.PENDING)
+            .values(status=RunStatus.RUNNING, updated_at=utc_now())
+        )
+        session.commit()
+        if result.rowcount == 0:
+            return None
+        run = session.get(RunModel, run_id)
+        if run is None:
+            return None
+        session.refresh(run)
+        return run
+
     def _process_run(self, run_id: str) -> None:
         session = get_session_factory()()
         try:
-            run = session.get(RunModel, run_id)
+            run = self._claim_pending_run(session, run_id)
             if run is None:
-                return
-            if run.status == RunStatus.CANCELLED:
+                current = session.get(RunModel, run_id)
+                if current is None:
+                    logger.warning("Skipping run %s: not found.", run_id)
+                else:
+                    logger.info(
+                        "Skipping run %s: cannot claim (current status=%s). "
+                        "Another worker or lifecycle action owns this run.",
+                        run_id,
+                        current.status,
+                    )
                 return
             set_run_id(run.id)
             set_request_id(run.request_id)
@@ -309,19 +428,26 @@ class OrchestrationService:
                     return
 
             workspace_path = create_run_workspace(run.id, task)
-            run.status = RunStatus.RUNNING
+            validation_profile = self._resolve_validation_profile(task, workspace_path)
+            run.validation_profile = validation_profile
             self._add_event(
                 session,
                 run.id,
                 "run_started",
-                f"Worker started the run in {workspace_path}.",
+                (
+                    f"Worker started the run in {workspace_path} using "
+                    f"{validation_profile} validation."
+                ),
             )
             self._record_state_snapshot(
                 session,
                 run,
                 workflow_state,
                 current_step="workspace_prepared",
-                payload={"workspace_path": str(workspace_path)},
+                payload={
+                    "workspace_path": str(workspace_path),
+                    "validation_profile": validation_profile,
+                },
             )
             session.commit()
 
@@ -385,10 +511,56 @@ class OrchestrationService:
             test_retries = 0
             total_retries = 0
             retry_feedback: list[str] = []
+            architect_refresh_threshold = max(
+                1, get_settings().architect_refresh_after_retries
+            )
 
             while True:
                 if self._checkpoint_cancelled(session, run, "coder_loop_checkpoint"):
                     return
+                if (
+                    retry_feedback
+                    and total_retries >= architect_refresh_threshold
+                    and total_retries % architect_refresh_threshold == 0
+                ):
+                    architect_model = cast(
+                        ArchitectureResponse,
+                        self._run_stage_with_provider_retries(
+                            session,
+                            run,
+                            task,
+                            architect_stage,
+                            self._build_architect_refresh_request(
+                                task.request_text,
+                                retry_feedback,
+                                planner_model,
+                            ),
+                        ),
+                    )
+                    workflow_state["architecture_output"] = architect_model.model_dump_json()
+                    if self._is_ui_task(task):
+                        ui_design_model = cast(
+                            UIDesignResponse,
+                            self._run_stage_with_provider_retries(
+                                session,
+                                run,
+                                task,
+                                ui_designer_stage,
+                                self._build_ui_design_refresh_request(
+                                    task.request_text,
+                                    retry_feedback,
+                                ),
+                            ),
+                        )
+                        workflow_state["ui_design_output"] = ui_design_model.model_dump_json()
+                    self._add_event(
+                        session,
+                        run.id,
+                        "architecture_refreshed",
+                        "Refreshed architecture/UI plan from accumulated failure feedback.",
+                        json.dumps({"failure_count": len(retry_feedback)}, indent=2),
+                    )
+                    session.commit()
                 coder_prompt = self._build_coder_request(
                     task.request_text,
                     run.id,
@@ -406,10 +578,18 @@ class OrchestrationService:
                 except ProviderError as exc:
                     test_retries += 1
                     total_retries += 1
-                    retry_feedback = [
+                    new_feedback = [
                         f"Coder stage failed before producing a usable patch: {exc}",
                         "Return valid JSON only, matching the code_change schema.",
                     ]
+                    retry_feedback = self._accumulate_failure_feedback(
+                        session,
+                        task,
+                        run,
+                        retry_feedback,
+                        new_feedback,
+                        source_label="coder_stage_failed",
+                    )
                     run.retry_count = total_retries
                     workflow_state["retry_count"] = total_retries
                     workflow_state["errors"] = retry_feedback
@@ -433,8 +613,10 @@ class OrchestrationService:
                         self._block_run(
                             session,
                             run,
+                            task,
                             "Coder stage retry threshold exceeded.",
                             json.dumps({"failures": retry_feedback}, indent=2),
+                            retry_feedback=retry_feedback,
                         )
                         return
 
@@ -452,15 +634,23 @@ class OrchestrationService:
                     test_retries += 1
                     total_retries += 1
                     guard_hint = self._patch_guard_fix_hint(str(exc))
-                    retry_feedback = [str(exc), guard_hint]
+                    new_feedback = [str(exc), guard_hint]
                     failed_context = self._patch_guard_anchor_context(run.id, str(exc))
                     if failed_context:
-                        retry_feedback.extend(
+                        new_feedback.extend(
                             [
                                 "Exact current file lines for the rejected patch target:",
                                 failed_context,
                             ]
                         )
+                    retry_feedback = self._accumulate_failure_feedback(
+                        session,
+                        task,
+                        run,
+                        retry_feedback,
+                        new_feedback,
+                        source_label="patch_guard_failed",
+                    )
                     run.retry_count = total_retries
                     workflow_state["retry_count"] = total_retries
                     workflow_state["errors"] = retry_feedback
@@ -471,6 +661,32 @@ class OrchestrationService:
                         "AI-generated patch violated deterministic safety guards.",
                         json.dumps({"failures": retry_feedback}, indent=2),
                     )
+                    if get_settings().safe_mode:
+                        details = {
+                            "guard_error": str(exc),
+                            "affected_files": self._affected_files_for_run(run.id),
+                            "is_scope_mismatch": "scope" in str(exc).lower(),
+                        }
+                        self._block_run(
+                            session,
+                            run,
+                            task,
+                            "Patch guard failed; safe mode stopped automatic retries.",
+                            json.dumps(details, indent=2),
+                            retry_feedback=retry_feedback,
+                            blocker=self._blocker_from_payload(
+                                run,
+                                "patch_guard_failed",
+                                "Patch guard failed; safe mode stopped automatic retries.",
+                                json.dumps(details, indent=2),
+                                retry_eligible=True,
+                                suggested_retry_instruction=(
+                                    "Generate a fresh patch from current file context only for "
+                                    "the files in task scope; do not replace unrelated files."
+                                ),
+                            ),
+                        )
+                        return
                     if self._should_block(run, review_retries, test_retries, total_retries):
                         if self._maybe_short_circuit_ui_noop(
                             session,
@@ -484,8 +700,10 @@ class OrchestrationService:
                         self._block_run(
                             session,
                             run,
+                            task,
                             "Patch guard retry threshold exceeded.",
                             json.dumps({"failures": retry_feedback}, indent=2),
+                            retry_feedback=retry_feedback,
                         )
                         return
 
@@ -500,6 +718,7 @@ class OrchestrationService:
                     retry_feedback,
                     run.id,
                     code_model,
+                    planner_model=planner_model,
                 )
                 review_model = cast(
                     ReviewResponse,
@@ -517,7 +736,15 @@ class OrchestrationService:
                 if not review_model.approved:
                     review_retries += 1
                     total_retries += 1
-                    retry_feedback = [review_model.summary, *review_model.issues]
+                    new_feedback = [review_model.summary, *review_model.issues]
+                    retry_feedback = self._accumulate_failure_feedback(
+                        session,
+                        task,
+                        run,
+                        retry_feedback,
+                        new_feedback,
+                        source_label="review_rejected",
+                    )
                     run.retry_count = total_retries
                     workflow_state["retry_count"] = total_retries
                     workflow_state["errors"] = retry_feedback
@@ -528,6 +755,33 @@ class OrchestrationService:
                         "Reviewer rejected the current proposal; retrying coder stage.",
                         review_model.model_dump_json(),
                     )
+                    if get_settings().safe_mode:
+                        self._block_run(
+                            session,
+                            run,
+                            task,
+                            (
+                                "Reviewer rejected the change; safe mode stopped automatic "
+                                "retries."
+                            ),
+                            review_model.model_dump_json(),
+                            retry_feedback=retry_feedback,
+                            blocker=self._blocker_from_payload(
+                                run,
+                                "review_rejected",
+                                (
+                                    "Reviewer rejected the change; safe mode stopped automatic "
+                                    "retries."
+                                ),
+                                review_model.model_dump_json(),
+                                retry_eligible=True,
+                                suggested_retry_instruction=(
+                                    "Address only the reviewer issues using the current workspace "
+                                    "diff and scoped file context."
+                                ),
+                            ),
+                        )
+                        return
                     if self._should_block(run, review_retries, test_retries, total_retries):
                         if self._maybe_short_circuit_ui_noop(
                             session,
@@ -541,8 +795,10 @@ class OrchestrationService:
                         self._block_run(
                             session,
                             run,
+                            task,
                             "Reviewer rejection threshold exceeded.",
                             review_model.model_dump_json(),
+                            retry_feedback=retry_feedback,
                         )
                         return
 
@@ -574,7 +830,15 @@ class OrchestrationService:
                 if not test_model.passed or not local_validation_passed:
                     test_retries += 1
                     total_retries += 1
-                    retry_feedback = [test_model.summary, *test_model.failures, *local_failures]
+                    new_feedback = [test_model.summary, *test_model.failures, *local_failures]
+                    retry_feedback = self._accumulate_failure_feedback(
+                        session,
+                        task,
+                        run,
+                        retry_feedback,
+                        new_feedback,
+                        source_label="tests_failed",
+                    )
                     run.retry_count = total_retries
                     workflow_state["retry_count"] = total_retries
                     workflow_state["errors"] = retry_feedback
@@ -585,6 +849,32 @@ class OrchestrationService:
                         "Validation stage reported failures; retrying coder stage.",
                         test_model.model_dump_json(),
                     )
+                    if get_settings().safe_mode:
+                        validation_payload = self._latest_validation_payload(session, run.id)
+                        validation_details = json.dumps(
+                            validation_payload or {"failures": local_failures},
+                            indent=2,
+                        )
+                        self._block_run(
+                            session,
+                            run,
+                            task,
+                            "Local validation failed; safe mode stopped automatic retries.",
+                            validation_details,
+                            retry_feedback=retry_feedback,
+                            blocker=self._blocker_from_payload(
+                                run,
+                                "validation_failed",
+                                "Local validation failed; safe mode stopped automatic retries.",
+                                validation_details,
+                                retry_eligible=True,
+                                suggested_retry_instruction=(
+                                    "Use the failed local command output as the only pass/fail "
+                                    "truth and rerun the selected profile after a scoped fix."
+                                ),
+                            ),
+                        )
+                        return
                     if self._should_block(run, review_retries, test_retries, total_retries):
                         if self._maybe_short_circuit_ui_noop(
                             session,
@@ -598,8 +888,10 @@ class OrchestrationService:
                         self._block_run(
                             session,
                             run,
+                            task,
                             "Validation retry threshold exceeded.",
                             test_model.model_dump_json(),
+                            retry_feedback=retry_feedback,
                         )
                         return
 
@@ -615,6 +907,7 @@ class OrchestrationService:
             run.status = RunStatus.AWAITING_APPROVAL
             run.current_stage = RunStage.APPROVAL
             run.error_message = None
+            run.active_blocker_json = None
             workflow_state["status"] = RunStatus.AWAITING_APPROVAL
             workflow_state["stage"] = RunStage.APPROVAL
             workflow_state["retry_count"] = total_retries
@@ -1273,13 +1566,30 @@ class OrchestrationService:
             "bytes": len(line_change.content.encode("utf-8")),
         }
 
+    def _resolve_validation_profile(self, task: TaskModel, workspace_path: Path) -> str:
+        task_profile = getattr(task, "validation_profile", None)
+        profile = resolve_validation_profile(
+            workspace_path,
+            task_profile=task_profile,
+            target_files=task.target_files,
+        )
+        return profile
+
     def _run_local_validation(
         self,
         session,
         run: RunModel,
         test_model: TestResultResponse,
     ) -> tuple[bool, list[str]]:
-        commands = self._validation_commands(test_model.commands, get_run_workspace_path(run.id))
+        workspace_path = get_run_workspace_path(run.id)
+        profile = getattr(run, "validation_profile", None) or "python"
+        custom_commands = self._custom_validation_commands_for_run(session, run)
+        command_specs = validation_commands_for_profile(
+            profile,
+            workspace_path,
+            custom_commands=custom_commands,
+        )
+        commands = [spec.command for spec in command_specs]
         if not commands:
             self._add_event(
                 session,
@@ -1292,13 +1602,17 @@ class OrchestrationService:
 
         results: list[dict[str, object]] = []
         failures: list[str] = []
-        for command in commands:
+        failed_command: str | None = None
+        failed_returncode: int | None = None
+        for spec in command_specs:
+            command = spec.command
             try:
-                result = run_validation_command(command, cwd=get_run_workspace_path(run.id))
+                result = run_validation_command(command, cwd=workspace_path, env=spec.env)
             except ConfigurationError as exc:
                 results.append(
                     {
                         "command": command,
+                        "env": spec.env,
                         "returncode": 126,
                         "stdout": "",
                         "stderr": str(exc),
@@ -1309,25 +1623,51 @@ class OrchestrationService:
                 continue
 
             payload = self._command_result_payload(result)
+            payload["env"] = spec.env
             results.append(payload)
             if result.returncode != 0:
+                if failed_command is None:
+                    failed_command = " ".join(result.command)
+                    failed_returncode = result.returncode
                 failures.append(
                     f"{' '.join(result.command)} failed with exit code {result.returncode}."
                 )
 
         passed = not failures
+        first_failed = next(
+            (item for item in results if self._payload_returncode(item) != 0),
+            None,
+        )
+        payload = {
+            "profile": profile,
+            "commands": commands,
+            "passed": passed,
+            "failed_command": failed_command,
+            "returncode": failed_returncode,
+            "stdout_excerpt": (
+                self._excerpt(str(first_failed.get("stdout", ""))) if first_failed else ""
+            ),
+            "stderr_excerpt": (
+                self._excerpt(str(first_failed.get("stderr", ""))) if first_failed else ""
+            ),
+            "affected_files": self._affected_files_for_run(run.id),
+            "is_scope_mismatch": False,
+            "model_tester_passed": test_model.passed,
+            "model_tester_summary": test_model.summary,
+            "results": results,
+        }
         self._add_event(
             session,
             run.id,
             "validation_commands_completed",
             "Local validation commands completed." if passed else "Local validation failed.",
-            json.dumps({"passed": passed, "results": results}, indent=2),
+            json.dumps(payload, indent=2),
         )
         session.add(
             self._make_log_artifact(
                 run.id,
                 "Local validation commands",
-                {"passed": passed, "results": results},
+                payload,
             )
         )
         session.commit()
@@ -1359,12 +1699,37 @@ class OrchestrationService:
             return []
 
         commands: list[list[str]] = []
-        for script in ("typecheck", "test"):
-            if script in scripts:
-                commands.append(["npm", "run", script])
+        if not (workspace_path / "node_modules").exists() and (
+            workspace_path / "package-lock.json"
+        ).exists():
+            commands.append(["npm", "ci"])
+        if "typecheck" in scripts:
+            commands.append(["npm", "run", "typecheck"])
+        elif "test" in scripts:
+            commands.append(["npm", "run", "test"])
         if not commands and "lint" in scripts:
             commands.append(["npm", "run", "lint"])
         return commands
+
+    def _custom_validation_commands_for_run(
+        self,
+        session,
+        run: RunModel,
+    ) -> list[list[str]]:
+        task = session.get(TaskModel, run.task_id)
+        if task is None:
+            return []
+        try:
+            raw_commands = json.loads(task.validation_commands_json or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw_commands, list):
+            return []
+        parsed: list[list[str]] = []
+        for item in raw_commands:
+            if isinstance(item, str) and item.strip():
+                parsed.append(shlex.split(item))
+        return parsed
 
     def _command_result_payload(self, result: CommandResult) -> dict[str, object]:
         return {
@@ -1374,6 +1739,57 @@ class OrchestrationService:
             "stderr": result.stderr,
             "timed_out": result.timed_out,
         }
+
+    def _payload_returncode(self, payload: dict[str, object]) -> int:
+        raw = payload.get("returncode")
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, str) and raw.strip().lstrip("-").isdigit():
+            return int(raw)
+        return 0
+
+    def _excerpt(self, text: str, limit: int = 2000) -> str:
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "\n... [truncated]"
+
+    def _affected_files_for_run(self, run_id: str) -> list[str]:
+        try:
+            diff = get_run_workspace_diff(run_id)
+        except Exception:
+            return []
+        files = diff.get("files")
+        if isinstance(files, list):
+            out: list[str] = []
+            for item in files:
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    out.append(item["path"])
+                elif isinstance(item, str):
+                    out.append(item)
+            return out
+        changed_files = diff.get("changed_files")
+        if isinstance(changed_files, list):
+            return [str(item) for item in changed_files]
+        return []
+
+    def _latest_validation_payload(self, session, run_id: str) -> dict[str, object] | None:
+        artifact = session.scalars(
+            select(ArtifactModel)
+            .where(
+                ArtifactModel.run_id == run_id,
+                ArtifactModel.artifact_type == ArtifactType.LOG,
+                ArtifactModel.title == "Local validation commands",
+            )
+            .order_by(ArtifactModel.id.desc())
+            .limit(1)
+        ).first()
+        if artifact is None:
+            return None
+        try:
+            payload = json.loads(artifact.content)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def _make_log_artifact(
         self,
@@ -1408,19 +1824,119 @@ class OrchestrationService:
             or total_retries >= MAX_TOTAL_RETRIES
         )
 
-    def _block_run(self, session, run: RunModel, message: str, payload_json: str) -> None:
+    def _repo_key_for_task(self, task: TaskModel) -> str:
+        return repo_key_for_source_spec(task.source_repo_spec)
+
+    def _accumulate_failure_feedback(
+        self,
+        session,
+        task: TaskModel,
+        run: RunModel,
+        accumulated: list[str],
+        new_items: list[str],
+        *,
+        source_label: str,
+    ) -> list[str]:
+        merged = merge_retry_feedback(accumulated, new_items)
+        if new_items:
+            persist_failure_lessons(
+                session,
+                self._repo_key_for_task(task),
+                run.id,
+                new_items,
+                source_label=source_label,
+            )
+        return merged
+
+    def _block_run(
+        self,
+        session,
+        run: RunModel,
+        task: TaskModel,
+        message: str,
+        payload_json: str,
+        *,
+        retry_feedback: list[str] | None = None,
+        blocker: dict[str, object] | None = None,
+    ) -> None:
+        if retry_feedback:
+            persist_failure_lessons(
+                session,
+                self._repo_key_for_task(task),
+                run.id,
+                retry_feedback,
+                source_label="run_blocked",
+            )
         run.status = RunStatus.BLOCKED
         run.current_stage = RunStage.CODER
         run.error_message = message
+        if blocker is None:
+            blocker = self._blocker_from_payload(
+                run,
+                "validation_failed",
+                message,
+                payload_json,
+                retry_eligible=True,
+            )
+        run.active_blocker_json = json.dumps(blocker, indent=2)
         self._add_event(session, run.id, "run_blocked", message, payload_json)
+        session.add(self._make_log_artifact(run.id, "Active blocker", blocker))
         self._record_state_snapshot(
             session,
             run,
             self._build_state_for_stage(run, RunStage.CODER),
             current_step="run_blocked",
-            payload={"message": message, "details": payload_json},
+            payload={"message": message, "details": payload_json, "blocker": blocker},
         )
         session.commit()
+
+    def _blocker_from_payload(
+        self,
+        run: RunModel,
+        blocker_type: str,
+        message: str,
+        payload_json: str,
+        *,
+        retry_eligible: bool,
+        suggested_retry_instruction: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        try:
+            parsed = json.loads(payload_json)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except json.JSONDecodeError:
+            payload = {}
+        failed_command = payload.get("failed_command")
+        raw_results = payload.get("results")
+        if failed_command is None and isinstance(raw_results, list):
+            for item in raw_results:
+                if isinstance(item, dict) and int(item.get("returncode") or 0) != 0:
+                    command = item.get("command")
+                    failed_command = " ".join(command) if isinstance(command, list) else command
+                    payload.setdefault("returncode", item.get("returncode"))
+                    payload.setdefault("stdout_excerpt", self._excerpt(str(item.get("stdout", ""))))
+                    payload.setdefault("stderr_excerpt", self._excerpt(str(item.get("stderr", ""))))
+                    break
+        return {
+            "type": blocker_type,
+            "message": message,
+            "command": failed_command,
+            "failed_path": payload.get("failed_path"),
+            "returncode": payload.get("returncode"),
+            "stdout_excerpt": payload.get("stdout_excerpt"),
+            "stderr_excerpt": payload.get("stderr_excerpt"),
+            "affected_files": payload.get("affected_files")
+            or self._affected_files_for_run(run.id),
+            "retry_eligible": retry_eligible,
+            "suggested_retry_instruction": suggested_retry_instruction
+            or (
+                "Regenerate a scoped patch from current file context, then rerun the "
+                "selected local validation profile."
+            ),
+            "is_scope_mismatch": bool(payload.get("is_scope_mismatch", False)),
+            "profile": getattr(run, "validation_profile", None) or "auto",
+        }
 
     def _maybe_short_circuit_ui_noop(
         self,
@@ -1432,16 +1948,28 @@ class OrchestrationService:
     ) -> bool:
         if not self._is_ui_task(task):
             return False
+        if "patch guard" in reason.lower():
+            return False
 
         diff = get_run_workspace_diff(run.id)
         if bool(diff.get("has_changes")):
             return False
 
-        commands = [["ruff", "check", "."], ["mypy", "app"], ["pytest", "-q"]]
+        profile = getattr(run, "validation_profile", None) or self._resolve_validation_profile(
+            task,
+            get_run_workspace_path(run.id),
+        )
+        command_specs = validation_commands_for_profile(profile, get_run_workspace_path(run.id))
         command_results: list[dict[str, object]] = []
-        for command in commands:
-            result = run_validation_command(command, cwd=get_run_workspace_path(run.id))
-            command_results.append(self._command_result_payload(result))
+        for spec in command_specs:
+            result = run_validation_command(
+                spec.command,
+                cwd=get_run_workspace_path(run.id),
+                env=spec.env,
+            )
+            payload = self._command_result_payload(result)
+            payload["env"] = spec.env
+            command_results.append(payload)
             if result.returncode != 0:
                 return False
 
@@ -1456,13 +1984,13 @@ class OrchestrationService:
         )
         review_model = ReviewResponse(
             approved=True,
-            summary="No additional code changes required for this UI task.",
+            summary="[noop] No code changes required; existing workspace satisfies validation.",
             issues=[],
         )
         test_model = TestResultResponse(
             passed=True,
             summary="No-op completion confirmed by local validation commands.",
-            commands=["ruff check .", "mypy app", "pytest -q"],
+            commands=[" ".join(spec.command) for spec in command_specs],
             failures=[],
         )
 
@@ -1474,7 +2002,14 @@ class OrchestrationService:
                 code_model,
             )
         )
-        session.add(self._make_artifact(run.id, ArtifactType.REVIEW, "Review result", review_model))
+        session.add(
+            self._make_artifact(
+                run.id,
+                ArtifactType.REVIEW,
+                "Review result [noop — no AI review performed]",
+                review_model,
+            )
+        )
         session.add(
             self._make_artifact(
                 run.id,
@@ -1487,7 +2022,19 @@ class OrchestrationService:
             self._make_log_artifact(
                 run.id,
                 "Local validation commands",
-                {"passed": True, "results": command_results},
+                {
+                    "profile": profile,
+                    "commands": [spec.command for spec in command_specs],
+                    "passed": True,
+                    "failed_command": None,
+                    "returncode": None,
+                    "stdout_excerpt": "",
+                    "stderr_excerpt": "",
+                    "affected_files": [],
+                    "is_scope_mismatch": False,
+                    "model_tester_passed": True,
+                    "results": command_results,
+                },
             )
         )
         self._add_event(
@@ -1643,8 +2190,9 @@ class OrchestrationService:
             sections.extend(
                 ["\nExisting app/ui/render.py public helper contract:", render_contract]
             )
-        if retry_feedback:
-            sections.extend(["\nRetry feedback:", *[f"- {item}" for item in retry_feedback]])
+        feedback_block = format_accumulated_retry_feedback(retry_feedback)
+        if feedback_block:
+            sections.append(feedback_block)
         if platform_console:
             sections.extend(
                 [
@@ -1825,7 +2373,8 @@ class OrchestrationService:
         diff_text = str(diff.get("diff_text") or "")
         if len(diff_text) > max_chars:
             diff_text = diff_text[:max_chars] + "\n... diff truncated ..."
-        changed_files = diff.get("changed_files") or []
+        raw_changed_files = diff.get("changed_files") or []
+        changed_files = raw_changed_files if isinstance(raw_changed_files, list) else []
         return "\n".join(
             [
                 "Workspace diff for current proposed patch:",
@@ -1842,37 +2391,116 @@ class OrchestrationService:
         retry_feedback: list[str],
         run_id: str,
         code_model: CodeChangeResponse,
+        planner_model: Optional[PlanResponse] = None,
     ) -> str:
         sections = [
             request_text,
             "Review the actual proposed code change below. Do not claim the repository is "
             "inaccessible; the changed files and workspace diff are included in this prompt.",
-            "Coder proposed changed files:",
-            *[f"- {path}" for path in code_model.changed_files],
-            "Coder implementation notes:",
-            *[f"- {note}" for note in code_model.implementation_notes],
-            self._workspace_diff_context(run_id),
         ]
-        if retry_feedback:
-            sections.extend(["Focus review on prior issues being resolved:", *retry_feedback])
+        if planner_model and planner_model.acceptance_criteria:
+            sections.extend(
+                [
+                    "\nPlanner acceptance criteria (verify every item is met):",
+                    *[f"- {c}" for c in planner_model.acceptance_criteria],
+                ]
+            )
+        sections.extend(
+            [
+                "\nCoder proposed changed files:",
+                *[f"- {path}" for path in code_model.changed_files],
+                "Coder implementation notes:",
+                *[f"- {note}" for note in code_model.implementation_notes],
+                self._workspace_diff_context(run_id),
+            ]
+        )
+        feedback_block = format_accumulated_retry_feedback(retry_feedback)
+        if feedback_block:
+            sections.extend(
+                [
+                    "Focus review on all accumulated issues from this run; confirm each is "
+                    "resolved or still present:",
+                    feedback_block,
+                ]
+            )
+        return "\n".join(sections)
+
+    def _build_architect_refresh_request(
+        self,
+        request_text: str,
+        retry_feedback: list[str],
+        planner_model: PlanResponse,
+    ) -> str:
+        sections = [
+            request_text,
+            "\nThe coder/review/test loop reported repeated failures. Update touched_modules, "
+            "file_change_plan, dependency_notes, and migration_notes so the next implementation "
+            "pass can succeed.",
+            format_accumulated_retry_feedback(retry_feedback),
+            "\nPlanner summary:",
+            planner_model.summary,
+            "\nPlanner acceptance criteria:",
+            *self._bullet_lines(planner_model.acceptance_criteria),
+        ]
+        return "\n".join(sections)
+
+    def _build_ui_design_refresh_request(
+        self,
+        request_text: str,
+        retry_feedback: list[str],
+    ) -> str:
+        sections = [
+            request_text,
+            "\nAdjust UI design direction based on accumulated implementation failures:",
+            format_accumulated_retry_feedback(retry_feedback),
+        ]
         return "\n".join(sections)
 
     def _build_test_request(
         self,
         request_text: str,
         retry_feedback: list[str],
-        run_id: str,
+        run_id: str | None = None,
     ) -> str:
+        profile = "auto"
+        commands: list[str] = []
+        if run_id is not None:
+            session = get_session_factory()()
+            try:
+                run = session.get(RunModel, run_id)
+                if run is not None:
+                    profile = getattr(run, "validation_profile", None) or "auto"
+                    specs = validation_commands_for_profile(
+                        profile,
+                        get_run_workspace_path(run_id),
+                    )
+                    commands = [" ".join(spec.command) for spec in specs]
+            except Exception:
+                commands = []
+            finally:
+                session.close()
         whitelist_note = (
-            "Validation command whitelist: commands may only be one of 'ruff check .', "
-            "'mypy app', 'pytest -q', 'pytest tests -q', or 'pytest <test-path> -q'. "
+            f"Selected validation profile: {profile}. Local command results are the only "
+            "pass/fail truth. Use only commands from this profile: "
+            f"{', '.join(commands) if commands else self._profile_command_fallback()}. "
             "Do not put grep, find, test, python -c, shell pipelines, redirects, bash, sh, "
-            "awk, sed, or curl in commands."
+            "awk, sed, curl, or unrelated backend/frontend commands in commands."
         )
-        sections = [request_text, whitelist_note, self._workspace_diff_context(run_id)]
-        if retry_feedback:
-            sections.extend(["Focus validation on prior failures being resolved:", *retry_feedback])
+        sections = [request_text, whitelist_note]
+        if run_id is not None:
+            sections.append(self._workspace_diff_context(run_id))
+        feedback_block = format_accumulated_retry_feedback(retry_feedback)
+        if feedback_block:
+            sections.extend(
+                [
+                    "Focus validation on all accumulated failures from this run:",
+                    feedback_block,
+                ]
+            )
         return "\n".join(sections)
+
+    def _profile_command_fallback(self) -> str:
+        return "the profile-scoped commands resolved by the platform"
 
     def _invoke_stage(
         self,
@@ -1890,7 +2518,7 @@ class OrchestrationService:
         if overlay:
             system_prompt = f"{system_prompt}\n\n--- Approved playbook overlay ---\n{overlay}"
         user_prompt = stage.user_prompt_template.format(request_text=request_text)
-        if stage.stage == RunStage.PLANNER:
+        if stage_receives_repo_lessons(stage.stage):
             user_prompt = load_lessons_prompt_prefix(session, repo_key) + user_prompt
         if timeout_seconds is None:
             return self._complete_stage(provider, stage, system_prompt, user_prompt)

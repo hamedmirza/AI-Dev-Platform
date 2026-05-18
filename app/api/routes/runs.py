@@ -3,7 +3,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.api.routes.config import require_api_token
+from app.core.enums import RunStatus
 from app.core.exceptions import WorkflowError
+from app.db.models import RunModel
 from app.db.session import get_db
 from app.schemas.diff import DiffResponse
 from app.schemas.run import (
@@ -174,18 +176,77 @@ def retry(run_id: str, payload: RunActionRequest, session: Session = Depends(get
 
 
 @router.post(
+    "/runs/{run_id}/retry-from-blocker",
+    dependencies=[Depends(require_api_token)],
+    response_model=RunActionResponse,
+)
+def retry_from_blocker(
+    run_id: str,
+    payload: RunActionRequest,
+    session: Session = Depends(get_db),
+):
+    run_response = get_run(session, run_id)
+    if run_response is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    if run_response.active_blocker is None:
+        raise HTTPException(status_code=409, detail="Run does not have an active blocker.")
+    note = payload.note or run_response.active_blocker.suggested_retry_instruction
+    try:
+        run = retry_run(session, run_id, note)
+    except WorkflowError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    get_orchestration_service().enqueue_run(run_id)
+    return RunActionResponse(
+        run_id=run.id,
+        status=run.status,
+        message="Run marked pending from active blocker.",
+    )
+
+
+@router.post("/runs/{run_id}/validate", dependencies=[Depends(require_api_token)])
+def validate_run(run_id: str):
+    try:
+        return get_orchestration_service().validate_run_workspace(run_id)
+    except WorkflowError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
+    "/runs/{run_id}/mark-manual-repair-validated",
+    dependencies=[Depends(require_api_token)],
+)
+def mark_manual_repair_validated(run_id: str):
+    try:
+        return get_orchestration_service().validate_run_workspace(run_id, mark_repaired=True)
+    except WorkflowError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
     "/runs/{run_id}/abort",
     dependencies=[Depends(require_api_token)],
     response_model=RunActionResponse,
 )
 def abort(run_id: str, payload: RunActionRequest, session: Session = Depends(get_db)):
+    pre = session.get(RunModel, run_id)
+    was_running = pre is not None and pre.status == RunStatus.RUNNING
     try:
         run = abort_run(session, run_id, payload.note)
     except WorkflowError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return RunActionResponse(run_id=run.id, status=run.status, message="Run cancelled.")
+    if was_running:
+        message = (
+            "Cancellation requested. The worker will stop at the next checkpoint "
+            "(the current step may complete first)."
+        )
+    else:
+        message = "Run cancelled."
+    return RunActionResponse(run_id=run.id, status=run.status, message=message)
 
 
 @router.post("/runs/{run_id}/cleanup-workspace", dependencies=[Depends(require_api_token)])
-def cleanup(run_id: str):
-    return cleanup_workspace(run_id)
+def cleanup(run_id: str, session: Session = Depends(get_db)):
+    try:
+        return cleanup_workspace(session, run_id)
+    except WorkflowError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
