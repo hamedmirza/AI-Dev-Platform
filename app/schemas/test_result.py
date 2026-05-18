@@ -1,14 +1,16 @@
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas._coerce import as_bool, as_string_list
 
 
 class TestResultResponse(BaseModel):
+    """Tester output. ``commands`` and ``failures`` default to ``[]`` (e.g., docs profile)."""
+
     passed: bool
     summary: str
-    commands: list[str]
-    failures: list[str]
+    commands: list[str] = Field(default_factory=list)
+    failures: list[str] = Field(default_factory=list)
 
     @field_validator("passed", mode="before")
     @classmethod

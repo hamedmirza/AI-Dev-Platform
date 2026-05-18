@@ -21,8 +21,10 @@ class LineChange(BaseModel):
 
 
 class CodeChangeResponse(BaseModel):
+    """Coder output. ``implementation_notes`` is advisory and defaults to ``[]``."""
+
     changed_files: list[str]
-    implementation_notes: list[str]
+    implementation_notes: list[str] = Field(default_factory=list)
     requires_operator_approval: bool = True
     line_changes: list[LineChange] = Field(default_factory=list)
     file_changes: list[FileChange] = Field(default_factory=list)

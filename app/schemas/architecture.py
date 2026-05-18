@@ -1,14 +1,16 @@
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas._coerce import as_string_list
 
 
 class ArchitectureResponse(BaseModel):
-    touched_modules: list[str]
+    """Architect output. ``file_change_plan`` is structural; the other lists are advisory."""
+
+    touched_modules: list[str] = Field(default_factory=list)
     file_change_plan: list[str]
-    dependency_notes: list[str]
-    migration_notes: list[str]
+    dependency_notes: list[str] = Field(default_factory=list)
+    migration_notes: list[str] = Field(default_factory=list)
 
     @field_validator(
         "touched_modules",
